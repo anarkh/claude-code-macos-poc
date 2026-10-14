@@ -1,0 +1,15 @@
+[Unit]
+Description=Mount persistent browser home without repairing unknown data
+Before=browser-session.service browser-ready.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 /opt/browser/profile.py
+ExecStop=/usr/bin/python3 /opt/browser/profile.py unmount
+TimeoutStartSec=90
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

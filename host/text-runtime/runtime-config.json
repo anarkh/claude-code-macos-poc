@@ -1,0 +1,7 @@
+{
+  "schema": "claude-vm-runtime/v1",
+  "image_dir": "images",
+  "runner": "../.build/release/vm-text-runtime",
+  "guest_runtime_dir": "../../guest/text-runtime",
+  "python": "/usr/bin/python3"
+}

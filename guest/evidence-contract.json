@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:claude-code-guest-poc:v1",
+  "title": "Toy guest isolation and stop evidence; never native SDK acceptance",
+  "type": "object",
+  "required": ["schema", "run_id", "platform", "status", "data_classification", "claim_scope", "native_sdk_cli_status", "external_delegation_status", "preflight", "tests", "cleanup"],
+  "properties": {
+    "schema": {"const": "claude-code-guest-poc/v1"},
+    "run_id": {"type": "string", "pattern": "^[a-f0-9]{32}$"},
+    "platform": {"type": "string"},
+    "status": {"enum": ["passed", "blocked", "unavailable", "unknown"]},
+    "data_classification": {"const": "fake_only"},
+    "claim_scope": {"const": "toy_guest_only"},
+    "native_sdk_cli_status": {"const": "not_executed"},
+    "external_delegation_status": {"const": "not_executed"},
+    "preflight": {
+      "type": "object", "required": ["status", "checks"],
+      "properties": {
+        "status": {"enum": ["passed", "blocked", "unavailable"]},
+        "checks": {"type": "array", "items": {"type": "object", "required": ["name", "status"]}}
+      }
+    },
+    "tests": {
+      "type": "object",
+      "properties": {
+        "isolation": {"type": "object", "required": ["status", "target", "positive_control", "attacks", "inheritance", "controller_snapshot", "non_denied_probes", "leaked_control_fd_identities", "boundary"]},
+        "stop_scope": {"type": "object", "required": ["status", "workload_identities", "cgroup_stop", "after_populated_zero_bytes", "after_observation_bytes", "write_digest_before_observation", "write_digest_after_observation", "observation_seconds", "live_original_processes", "boundary"]}
+      }
+    },
+    "cleanup": {"type": "object"},
+    "error": {"type": "object", "required": ["type", "message"]},
+    "evidence_file": {"type": "string", "pattern": "^/var/lib/claude-code-poc/evidence/[a-f0-9]{32}\\.json$"}
+  },
+  "$defs": {
+    "syscall_probe": {
+      "type": "object", "required": ["name", "outcome"],
+      "properties": {
+        "name": {"type": "string"},
+        "outcome": {"enum": ["allowed", "denied", "unsupported", "inconclusive", "not_executed"]},
+        "errno": {"type": "integer"},
+        "sentinel_observed": {"type": "boolean"},
+        "fake_message_write": {"type": "integer"}
+      }
+    }
+  },
+  "description": "Exit 0 and passed mean only the requested toy tests passed. All App project execution remains blocked until native SDK/CLI entry/FD, prompt source and external delegation coverage are separately accepted. Missing tests are not executed, never passed. Cleanup unknown means retain the execution lock and investigate."
+}

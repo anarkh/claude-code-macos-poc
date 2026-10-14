@@ -1,0 +1,26 @@
+{
+  "policies": {
+    "Proxy": {
+      "Mode": "manual",
+      "Locked": true,
+      "HTTPProxy": "127.0.0.1:7890",
+      "SSLProxy": "127.0.0.1:7890",
+      "Passthrough": ""
+    },
+    "DNSOverHTTPS": {
+      "Enabled": false,
+      "Locked": true
+    },
+    "DisableTelemetry": true,
+    "DisableFirefoxStudies": true,
+    "DisableFirefoxAccounts": true,
+    "DisableProfileImport": true,
+    "DisableAppUpdate": true,
+    "DontCheckDefaultBrowser": true,
+    "ExtensionSettings": {
+      "*": {
+        "installation_mode": "blocked"
+      }
+    }
+  }
+}

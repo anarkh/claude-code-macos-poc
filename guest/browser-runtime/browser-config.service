@@ -1,0 +1,13 @@
+[Unit]
+Description=Apply bounded typed browser session setting
+Before=browser-session.service browser-ready.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 /opt/browser/config.py
+TimeoutStartSec=15
+
+[Install]
+WantedBy=multi-user.target

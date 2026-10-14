@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>プライバシー確認</title>
+<style>
+  :root { color-scheme: light; font-family: sans-serif; background:#f4f6f8; color:#19232f; }
+  body { max-width:900px; margin:24px auto; padding:24px; border-radius:16px; background:white; }
+  h1 { margin-top:0; font-size:28px; } p { line-height:1.7; color:#53616f; }
+  table { width:100%; border-collapse:collapse; margin:20px 0; }
+  th,td { text-align:left; border-bottom:1px solid #e5e9ee; padding:9px 0; }
+  th { width:46%; font-weight:500; color:#53616f; } td { font-family:monospace; font-size:16px; }
+  .badge { display:inline-block; background:#e9f5ed; color:#26733d; border-radius:20px; padding:6px 12px; font-size:13px; }
+</style>
+<body>
+<span class="badge">ローカル確認 · 外部通信なし</span>
+<h1>プライバシー確認</h1>
+<p>このページは隔離されたブラウザー内で表示しています。アドレスバーに HTTPS のURLを入力すると、許可された接続だけがホストのプロキシを通ります。</p>
+<table>
+<tr><th>Web に見えるタイムゾーン</th><td id="timezone"></td></tr>
+<tr><th>Web に見える UTC 差 (分)</th><td id="offset"></td></tr>
+<tr><th>Web に見える言語</th><td id="language"></td></tr>
+<tr><th>画面サイズ</th><td id="screen"></td></tr>
+<tr><th>WebRTC</th><td id="rtc"></td></tr>
+<tr><th>Web に見えるプラットフォーム</th><td id="platform"></td></tr>
+<tr><th>Web に見える論理 CPU 数</th><td id="cpu"></td></tr>
+<tr><th>WebGL レンダラー</th><td id="gpu"></td></tr>
+</table>
+<p>通常モードは日本語と Asia/Tokyo、完全なフィンガープリント耐性モードは UTC+0 と en-US を使います。Firefox 157 の時刻識別子は Atlantic/Reykjavik です。日本語 UI とシステムのタイムゾーンは維持されます。</p>
+<script>
+const timezone=Intl.DateTimeFormat().resolvedOptions().timeZone;
+const language=navigator.language;
+const platform=navigator.platform;
+const cpu=navigator.hardwareConcurrency;
+const offset=-new Date().getTimezoneOffset();
+let renderer='masked/unavailable';
+try {
+  const gl=document.createElement('canvas').getContext('webgl');
+  const info=gl && gl.getExtension('WEBGL_debug_renderer_info');
+  if (info) renderer=String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL));
+} catch (error) {
+  renderer='masked/unavailable';
+}
+document.querySelector('#timezone').textContent=timezone;
+document.querySelector('#offset').textContent=String(offset);
+document.querySelector('#language').textContent=language;
+document.querySelector('#screen').textContent=screen.width+' × '+screen.height;
+document.querySelector('#rtc').textContent=typeof RTCPeerConnection==='undefined'?'無効':'有効';
+document.querySelector('#platform').textContent=platform;
+document.querySelector('#cpu').textContent=String(cpu);
+document.querySelector('#gpu').textContent=renderer==='masked/unavailable'?'遮蔽 / 利用不可':renderer==='Mozilla'?'Mozilla (RFP で遮蔽)':renderer;
+document.title='プライバシー確認 — TZ='+timezone+' LANG='+language+' OFFSET='+offset+' PLATFORM='+encodeURIComponent(platform)+' CPU='+cpu+' GPU='+encodeURIComponent(renderer);
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+[Unit]
+Description=Confirm visible Firefox window
+After=browser-session.service
+Requires=browser-session.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/browser/session-ready.sh
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/root/.Xauthority
+TimeoutStartSec=70
+
+[Install]
+WantedBy=multi-user.target
