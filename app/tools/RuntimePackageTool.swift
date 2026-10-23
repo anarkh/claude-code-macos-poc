@@ -3,12 +3,13 @@ import CryptoKit
 import Darwin
 
 private enum RuntimeToolFailure: Error {
-    case usage, keyInvalid, outputExists
+    case usage, keyInvalid, outputExists, bundleVersionInvalid
     var message: String {
         switch self {
         case .usage: "Usage: runtime-package-tool prepare-key --key-file ABS --trust-output ABS | bundled-manifest --contents-root ABS --output ABS --version X.Y.Z | pack --contents-root ABS --output ABS.clauderuntime --key-file ABS --version X.Y.Z | publish-layout --package ABS.clauderuntime --trust-file ABS --output ABS_NEW_DIRECTORY"
         case .keyInvalid: "Publisher key is invalid. Use a current-user, private 0600 Ed25519 key file in a 0700 directory outside the repository."
         case .outputExists: "Output already exists; preserve it or select a new output location."
+        case .bundleVersionInvalid: "Bundled runtime requires a valid CFBundleShortVersionString in Contents/Info.plist."
         }
     }
 }
@@ -64,6 +65,7 @@ enum RuntimePackageTool {
         case "bundled-manifest":
             let contents = try url("--contents-root")
             let manifest = try makeManifest(contents: contents, version: options["--version"]!)
+            try validateBundledCompatibility(manifest, contents: contents)
             let output = try url("--output")
             try RuntimePackageIO.atomicWrite(encode(manifest), to: output)
             printSummary(manifest, status: "bundled_manifest_written")
@@ -243,6 +245,16 @@ enum RuntimePackageTool {
         }
     }
 
+    private static func validateBundledCompatibility(_ manifest: RuntimePackageManifest, contents: URL) throws {
+        let bytes = try RuntimePackageIO.readSmall(contents.appendingPathComponent("Info.plist"), limit: 64 * 1024)
+        guard let info = try? PropertyListSerialization.propertyList(from: bytes, format: nil) as? [String: Any],
+              let appVersion = info["CFBundleShortVersionString"] as? String,
+              RuntimePackageIO.isVersion(appVersion) else { throw RuntimeToolFailure.bundleVersionInvalid }
+        // Validate the actual App version, independently of the runtime release
+        // version, so a new App cannot ship a bundle that rejects itself.
+        try manifest.validateCompatibility(appVersion: appVersion)
+    }
+
     private static func makeManifest(contents: URL, version: String) throws -> RuntimePackageManifest {
         guard RuntimePackageIO.isVersion(version) else { throw RuntimeToolFailure.usage }
         try RuntimePackageIO.validateAncestors(contents)
@@ -282,7 +294,7 @@ enum RuntimePackageTool {
         let manifest = RuntimePackageManifest(schema: RuntimePackageManifest.schemaValue,
                                               version: version, cliVersion: cli, sdkVersion: sdk, nodeVersion: node,
                                               hostProtocol: 1, platform: "macOS-arm64", minimumOSVersion: "14.0.0",
-                                              minimumAppVersion: "0.12.0", maximumAppVersionExclusive: "0.13.0",
+                                              minimumAppVersion: "0.12.0", maximumAppVersionExclusive: "0.14.0",
                                               files: files.sorted { $0.path < $1.path })
         try manifest.validate()
         try RuntimePackageIO.inventory(contents, manifest: manifest)

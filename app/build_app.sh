@@ -2,6 +2,8 @@
 set -euo pipefail
 app_root=$(cd "$(dirname "$0")" && pwd)
 project_root=$(cd "$app_root/.." && pwd)
+app_version=0.13.3
+app_build=25
 node_executable=${1:-}
 browser_images=${3:-"$project_root/host/browser-runtime/images"}
 if [ -z "$node_executable" ]; then
@@ -41,9 +43,9 @@ mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp "$binary" "$bundle/Contents/MacOS/ClaudeIsolationPoC"
 cp "$app_icon" "$bundle/Contents/Resources/AppIcon.icns"
 python3 "$app_root/tools/package_browser_runtime.py" "$browser_images" "$bundle/Contents/Resources/BrowserRuntime/images"
-python3 - "$bundle" "$project_root" "$node_executable" <<'PY'
+python3 - "$bundle" "$project_root" "$node_executable" "$app_version" "$app_build" <<'PY'
 import hashlib, json, pathlib, plistlib, re, shutil, subprocess, sys
-bundle, project_root, node = sys.argv[1:]
+bundle, project_root, node, app_version, app_build = sys.argv[1:]
 contents = pathlib.Path(bundle) / 'Contents'
 source = pathlib.Path(project_root)
 runtime = contents / 'Resources' / 'Runtime'
@@ -102,7 +104,7 @@ manifest = {str(p.relative_to(contents)): hashlib.sha256(p.read_bytes()).hexdige
 (contents / 'Resources/PrivacyRuntimeManifest.json').write_text(json.dumps(manifest, sort_keys=True, indent=2) + '\n')
 config = {'projectRoot': project_root, 'nodeExecutable': node}
 (contents / 'Resources' / 'ProjectConfiguration.json').write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
-info = {'CFBundleName': 'ClaudeIsolationPoC', 'CFBundleDisplayName': 'Claude 隔离工作台', 'CFBundleIdentifier': 'com.claude-isolation-poc.app', 'CFBundleExecutable': 'ClaudeIsolationPoC', 'CFBundlePackageType': 'APPL', 'CFBundleIconFile': 'AppIcon', 'CFBundleVersion': '24', 'CFBundleShortVersionString': '0.13.2', 'LSMinimumSystemVersion': '14.0', 'NSHighResolutionCapable': True, 'NSPrincipalClass': 'NSApplication',
+info = {'CFBundleName': 'ClaudeIsolationPoC', 'CFBundleDisplayName': 'Claude 隔离工作台', 'CFBundleIdentifier': 'com.claude-isolation-poc.app', 'CFBundleExecutable': 'ClaudeIsolationPoC', 'CFBundlePackageType': 'APPL', 'CFBundleIconFile': 'AppIcon', 'CFBundleVersion': app_build, 'CFBundleShortVersionString': app_version, 'LSMinimumSystemVersion': '14.0', 'NSHighResolutionCapable': True, 'NSPrincipalClass': 'NSApplication',
         'CFBundleDocumentTypes': [{'CFBundleTypeName': 'Claude Runtime Package', 'CFBundleTypeRole': 'Viewer', 'LSHandlerRank': 'Owner', 'LSTypeIsPackage': True, 'LSItemContentTypes': ['com.claude-isolation.runtime-package']}],
         'UTExportedTypeDeclarations': [{'UTTypeIdentifier': 'com.claude-isolation.runtime-package', 'UTTypeDescription': 'Claude Runtime Package', 'UTTypeConformsTo': ['com.apple.package'], 'UTTypeTagSpecification': {'public.filename-extension': ['clauderuntime']}}]}
 with (contents / 'Info.plist').open('wb') as handle:
@@ -114,7 +116,7 @@ runtime_signing_key="$HOME/Library/Application Support/ClaudeIsolationBuild/Sign
 "$runtime_package_tool" prepare-key --key-file "$runtime_signing_key" \
   --trust-output "$bundle/Contents/Resources/RuntimeTrust.json"
 "$runtime_package_tool" bundled-manifest --contents-root "$bundle/Contents" \
-  --output "$bundle/Contents/Resources/BundledRuntimeManifest.json" --version 0.13.2
+  --output "$bundle/Contents/Resources/BundledRuntimeManifest.json" --version "$app_version"
 codesign --force --sign - --entitlements "$app_root/browser.entitlements" --identifier com.claude-isolation-poc.app "$bundle"
 codesign --verify --strict "$bundle"
 mv "$bundle" "$final_bundle"
