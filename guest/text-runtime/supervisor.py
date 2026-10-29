@@ -12,10 +12,11 @@ import time
 
 MAX_FRAME = 1024 * 1024
 MAX_STREAM = 32 * 1024 * 1024
+MAX_PROJECT_STREAM = 64 * 1024 * 1024
 UID = 59999
 PORT = 40124
 GUEST_INPUT = frozenset(('start', 'provider_response', 'provider_chunk', 'provider_end', 'cancel'))
-GUEST_OUTPUT = frozenset(('ready', 'native_init', 'provider_request', 'result', 'runtime_error'))
+GUEST_OUTPUT = frozenset(('ready', 'native_init', 'provider_request', 'tool_activity', 'result', 'runtime_error'))
 ENV = {'PATH': '/usr/bin:/bin', 'HOME': '/home/claude', 'USER': 'claude',
        'LOGNAME': 'claude', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
        'TMPDIR': '/home/claude/tmp', 'CLAUDE_CONFIG_DIR': '/home/claude/.claude'}
@@ -42,6 +43,7 @@ def main():
         raise RuntimeError('guest_preflight')
     if sorted(p.name for p in Path('/sys/class/net').iterdir()) != ['lo']:
         raise RuntimeError('guest_network_devices')
+    stream_limit = MAX_PROJECT_STREAM if Path('/etc/claude-text/project-enabled').is_file() else MAX_STREAM
     channel = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
     channel.settimeout(10)
     channel.connect((2, PORT))
@@ -94,7 +96,7 @@ def main():
                     terminate()
                     return
                 total += len(raw)
-                if total > MAX_STREAM:
+                if total > stream_limit:
                     raise ValueError('stream_bound')
                 value = frame(raw, GUEST_INPUT)
                 child.stdin.write(raw)
@@ -127,7 +129,7 @@ def main():
             if not raw:
                 break
             total += len(raw)
-            if total > MAX_STREAM:
+            if total > stream_limit:
                 raise ValueError('stream_bound')
             value = frame(raw, GUEST_OUTPUT)
             writer.write(raw)

@@ -5,8 +5,10 @@ import { mkdir, writeFile, readFile, readdir, stat } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveHostHome, createPocSandboxProfile, serializePocSummary } from './poc-host-privacy.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const hostHome = await resolveHostHome();
 const RUN = path.join(ROOT, 'runs', new Date().toISOString().replaceAll(':', '-'));
 const HOME = path.join(RUN, 'home');
 const CWD = path.join(RUN, 'workspace');
@@ -78,7 +80,7 @@ const server = http.createServer(async (req, res) => {
 server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const port = server.address().port;
-const profile = `(version 1)\n(allow default)\n(deny network*)\n(allow network-outbound (remote ip "localhost:${port}"))\n(deny file-write*)\n(allow file-write* (subpath ${JSON.stringify(ROOT)}) (literal "/dev/null") (literal "/dev/tty"))\n(deny file-read* (subpath "/Users/bytedance") (subpath "/Library/Application Support/ClaudeCode") (subpath "/Library/Keychains"))\n(allow file-read* (subpath ${JSON.stringify(ROOT)}))\n(deny process-exec (literal "/usr/bin/security"))\n`;
+const profile = createPocSandboxProfile({ sdkRoot: ROOT, hostHome: hostHome.path, port });
 const profilePath = path.join(RUN, 'cli.sb');
 await writeFile(profilePath, profile);
 const env = {
@@ -316,6 +318,6 @@ finally {
     file_assertions: evidence.file_assertions, surviving_process_groups: evidence.surviving_process_groups,
     full_local_evidence: path.join(RUN, 'evidence.json'),
   };
-  await writeFile(path.join(ROOT, 'evidence', 'native-session-summary.json'), JSON.stringify(slim, null, 2).replaceAll(ROOT, '<SDK_DIR>').replaceAll('/Users/bytedance', '<HOST_USER_HOME>'));
+  await writeFile(path.join(ROOT, 'evidence', 'native-session-summary.json'), serializePocSummary(slim, ROOT, hostHome.aliases));
   console.log(JSON.stringify({ evidence: path.join(RUN, 'evidence.json'), cli_version: evidence.cli_version, resume: evidence.resume_assertions, file_assertions: evidence.file_assertions, fatal_error: evidence.fatal_error, surviving_groups: evidence.surviving_process_groups }));
 }

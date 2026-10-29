@@ -50,12 +50,14 @@ struct StdioExecutionConnectionTester: ExecutionConnectionTesting {
     let configuration: AppConfiguration
     var networkPolicyProvider: any NetworkPolicyProviding = SavedNetworkPolicyProvider()
     var runtimeProfileProvider: any RuntimeProfileProviding = SavedRuntimeProfileProvider()
+    var installationIdentityStore: any InstallationIdentityProviding = FileInstallationIdentityStore()
     func testSubscription(token: String, model: String) async throws -> ExecutionConnectionReply {
         let request = ChatRequest(request_id: UUID().uuidString, model: model,
                                   messages: [.init(role: "user", text: "Reply with exactly CLAUDE_SUBSCRIPTION_CLI_OK and nothing else.")],
                                   provider: .claudeSubscription, subscriptionToken: token)
         let provider = StdioChatProvider(configuration: configuration,
-                                         networkPolicyProvider: networkPolicyProvider, runtimeProfileProvider: runtimeProfileProvider)
+                                         networkPolicyProvider: networkPolicyProvider, runtimeProfileProvider: runtimeProfileProvider,
+                                         installationIdentityStore: installationIdentityStore)
         var completedText: String?
         do {
             for try await event in provider.events(for: request) {

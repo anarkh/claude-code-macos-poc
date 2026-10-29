@@ -115,7 +115,7 @@ final class ClaudeLoginResetModel: ObservableObject {
             let snapshot = try runtime.scan()
             guard !snapshot.hasBlockingRuns else { throw LoginResetLifecycleFailure.workStillRunning }
             guard !snapshot.items.contains(where: { $0.status == .failed }) else { throw OwnedRuntimeCleanupFailure.scanUnavailable }
-            progress = "正在删除并验证 App 订阅 Token…"
+            progress = "正在清除并验证当前账号的订阅授权…"
             credentialStageStarted = true
             try execution.clearSubscriptionForLoginReset()
             credentialVerified = true
@@ -124,9 +124,9 @@ final class ClaudeLoginResetModel: ObservableObject {
             let cleaned = runtime.cleanup(snapshot)
             runtimeSummary = "已删除 \(cleaned.deletedCount) 项；保留待检查 \(cleaned.manualCount) 项；失败或变化 \(cleaned.failedCount) 项。"
             if cleaned.failedCount > 0 || cleaned.hasBlockingRuns {
-                result = "App 订阅 Token 已清除并验证，已打开空白会话。部分运行残留未清理，请重新检查。"
+                result = "当前账号授权已清除并验证，已打开空白会话，其他账号已保留。部分运行残留未清理，请重新检查。"
             } else {
-                result = "App 订阅 Token 已清除并验证，已打开空白会话。" +
+                result = "当前账号授权已清除并验证，已打开空白会话，其他账号已保留。" +
                     (cleaned.manualCount > 0 ? "无法确认归属的残留已保留。" : "已确认归属的运行残留已处理。")
             }
             progress = "完成"

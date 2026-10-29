@@ -95,6 +95,97 @@ func requestTraceChecks() -> [(String, Bool)] {
         do { _ = try parser.consume(event(changed)); check("terminal_cannot_replace_actual_request", false) }
         catch { check("terminal_cannot_replace_actual_request", true) }
     } catch { check("redacted_snapshot_and_request_identity", false) }
+    checks.append(contentsOf: requestTracePrivacyChecks())
+    return checks
+}
+
+private func requestTracePrivacyChecks() -> [(String, Bool)] {
+    var checks: [(String, Bool)] = []
+    func check(_ name: String, _ passed: Bool) { checks.append(("request_trace_privacy_" + name, passed)) }
+    let runID = UUID()
+    let capturedAt = Date(timeIntervalSince1970: 1_800_000_000)
+    let retainedMessage = "synthetic-body-marker-keep-only-with-explicit-capture"
+    let sensitiveMarkers = ["synthetic-device-identity", "synthetic-session-identity", "synthetic-account-identity",
+                            "synthetic-api-key", "synthetic-access-token", "synthetic-refresh-token", "synthetic-authorization",
+                            "synthetic-embedded-identity", "sk-ant-oat01-syntheticRecognizableToken12345"]
+    let sessionHeader = UUID().uuidString
+    do {
+        let bodyObject: [String: Any] = [
+            "model": "deepseek-flash[1m]",
+            "messages": [["role": "user", "content": retainedMessage]],
+            "metadata": ["device_id": sensitiveMarkers[0], "session_id": sensitiveMarkers[1], "user_id": sensitiveMarkers[2]],
+            "api_key": sensitiveMarkers[3],
+            "nested": ["access_token": sensitiveMarkers[4], "refresh_token": sensitiveMarkers[5], "authorization": sensitiveMarkers[6]],
+            "encoded": "{\"session_id\":\"\(sensitiveMarkers[7])\"}",
+            "free_text": "Synthetic token \(sensitiveMarkers[8])"
+        ]
+        let body = String(decoding: try JSONSerialization.data(withJSONObject: bodyObject, options: [.sortedKeys]), as: UTF8.self)
+        let fixture = requestTraceFixture(runID: runID, phase: .response, body: body)
+        var wireObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(fixture)) as! [String: Any]
+        var headers = wireObject["headers"] as! [String: String]
+        headers["x-claude-code-session-id"] = sessionHeader
+        wireObject["headers"] = headers
+        let originalBytes = try JSONSerialization.data(withJSONObject: wireObject, options: [.sortedKeys])
+        let wire = try JSONDecoder().decode(ChatRequestTrace.self, from: originalBytes)
+        let summary = wire.persisted(captureBody: false, capturedAt: capturedAt)
+        let full = wire.persisted(captureBody: true, capturedAt: capturedAt)
+        try summary.validate(runID: runID)
+        try full.validate(runID: runID)
+        check("default_projection_omits_body", summary.schema == "claude-request-trace/v2" && summary.bodyAvailability == .notCaptured && !summary.hasBody && summary.body.isEmpty)
+        let summaryBytes = try JSONEncoder().encode(summary)
+        let encodedSummary = String(decoding: summaryBytes, as: UTF8.self)
+        check("default_projection_never_serializes_sensitive_body_markers", !encodedSummary.contains(retainedMessage) && sensitiveMarkers.allSatisfy { !encodedSummary.contains($0) })
+        check("projection_removes_session_header", summary.headers["x-claude-code-session-id"] == nil && full.headers["x-claude-code-session-id"] == nil)
+        check("summary_preserves_request_metadata", summary.bodyBytes == wire.bodyBytes && summary.attemptID == wire.attemptID && summary.phase == wire.phase && summary.status == wire.status && summary.durationMS == wire.durationMS)
+        check("explicit_capture_retains_exact_body_for_24_hours", full.bodyAvailability == .available && full.hasBody && full.body == body && full.capturedAt == capturedAt && full.expiresAt == capturedAt.addingTimeInterval(86_400))
+        check("capture_before_deadline_unchanged", full.removingExpiredBody(now: capturedAt.addingTimeInterval(86_399.999)) == full)
+        let expired = full.removingExpiredBody(now: capturedAt.addingTimeInterval(86_400))
+        try expired.validate(runID: runID)
+        check("capture_expires_at_exact_deadline", expired.bodyAvailability == .expired && !expired.hasBody && expired.body.isEmpty && expired.bodyBytes == wire.bodyBytes)
+        check("expiry_preserves_diagnostic_metadata", expired.attemptID == full.attemptID && expired.status == full.status && expired.phase == full.phase && expired.durationMS == full.durationMS && expired.capturedAt == full.capturedAt && expired.expiresAt == full.expiresAt)
+        check("summary_and_expired_projection_are_idempotent", summary.removingExpiredBody(now: capturedAt.addingTimeInterval(172_800)) == summary && expired.removingExpiredBody(now: capturedAt.addingTimeInterval(172_800)) == expired)
+        check("legacy_has_no_inferred_expiry", wire.bodyAvailability == .legacy && wire.hasBody && wire.capturedAt == nil && wire.expiresAt == nil && wire.removingExpiredBody(now: capturedAt.addingTimeInterval(100 * 86_400)) == wire)
+        let removedLegacy = wire.removingBody()
+        let removedFull = full.removingBody()
+        try removedLegacy.validate(runID: runID)
+        try removedFull.validate(runID: runID)
+        check("manual_removal_covers_legacy_and_new_bodies", [removedLegacy, removedFull].allSatisfy { $0.bodyAvailability == .removed && !$0.hasBody && $0.body.isEmpty && $0.bodyBytes == wire.bodyBytes && $0.status == wire.status && $0.attemptID == wire.attemptID })
+        check("manual_removal_drops_legacy_session_header", removedLegacy.headers["x-claude-code-session-id"] == nil)
+        check("new_states_roundtrip", try [summary, full, expired, removedLegacy, removedFull].allSatisfy { try JSONDecoder().decode(ChatRequestTrace.self, from: JSONEncoder().encode($0)) == $0 })
+
+        let summaryExport = try full.diagnosticExport(now: capturedAt)
+        let bodyExport = try full.diagnosticExport(includeBody: true, now: capturedAt)
+        let expiredExport = try full.diagnosticExport(includeBody: true, now: capturedAt.addingTimeInterval(86_400))
+        check("export_defaults_to_summary", !summaryExport.contains(retainedMessage) && sensitiveMarkers.allSatisfy { !summaryExport.contains($0) })
+        check("explicit_export_removes_identity_and_secret_fields", bodyExport.contains(retainedMessage) && sensitiveMarkers.allSatisfy { !bodyExport.contains($0) } && !bodyExport.contains(sessionHeader))
+        check("export_enforces_expiry_before_preview", !expiredExport.contains(retainedMessage) && sensitiveMarkers.allSatisfy { !expiredExport.contains($0) })
+        check("export_produces_valid_json", [summaryExport, bodyExport, expiredExport].allSatisfy { (try? JSONSerialization.jsonObject(with: Data($0.utf8))) != nil })
+        let originalWire = try JSONDecoder().decode(ChatRequestTrace.self, from: originalBytes)
+        check("projection_and_export_leave_outbound_wire_unchanged", wire.schema == "claude-request-trace/v1" && wire.body == body && wire.headers["x-claude-code-session-id"] == sessionHeader && originalWire == wire)
+
+        func rejectsStored(_ name: String, mutate: (inout [String: Any]) -> Void) throws {
+            var value = try JSONSerialization.jsonObject(with: summaryBytes) as! [String: Any]
+            mutate(&value)
+            do {
+                _ = try JSONDecoder().decode(ChatRequestTrace.self, from: JSONSerialization.data(withJSONObject: value))
+                check(name, false)
+            } catch { check(name, true) }
+        }
+        try rejectsStored("unknown_storage_field_rejected") { $0["private_raw_error"] = "synthetic-error" }
+        try rejectsStored("missing_body_state_rejected") { $0.removeValue(forKey: "body_state") }
+        try rejectsStored("missing_nullable_expiry_rejected") { $0.removeValue(forKey: "expires_at") }
+        try rejectsStored("summary_cannot_hide_nonempty_body") { $0["body"] = body }
+        try rejectsStored("summary_cannot_reintroduce_session_header") { $0["headers"] = ["x-claude-code-session-id": UUID().uuidString] }
+        try rejectsStored("unknown_body_state_rejected") { $0["body_state"] = "hidden" }
+        try rejectsStored("summary_cannot_claim_capture_dates") { $0["captured_at"] = capturedAt.timeIntervalSince1970 }
+        try rejectsStored("captured_body_requires_both_dates") { $0["body_state"] = "captured"; $0["body"] = body }
+        try rejectsStored("retention_cannot_extend_beyond_24_hours") {
+            $0["body_state"] = "captured"; $0["body"] = body
+            $0["captured_at"] = capturedAt.timeIntervalSince1970
+            $0["expires_at"] = capturedAt.addingTimeInterval(86_401).timeIntervalSince1970
+        }
+        try rejectsStored("unsupported_trace_schema_rejected") { $0["schema"] = "claude-request-trace/v3" }
+    } catch { check("setup_or_operation_failure", false) }
     return checks
 }
 

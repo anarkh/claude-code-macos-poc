@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { link, mkdtemp, mkdir, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { link, lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
@@ -17,6 +17,8 @@ const ERROR = { type: 'error', code: 'UPDATE_HEALTH_FAILED' };
 const SESSION_ID = 'fcbcb8dd-8564-4e5a-a574-2203a5a54c8c';
 const SCRIPT = fileURLToPath(new URL('./health.mjs', import.meta.url));
 const SYSTEM = 'You are an assistant in a text-only conversation. Respond to the user. No tools are available; do not emit tool calls.';
+const PROJECT_SYSTEM = 'You are an assistant working in the user-selected project directory /home/claude/project. Use only the enabled project tools. All commands run inside the isolated VM.';
+const PROJECT_TOOLS = ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'];
 const IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 const SUBSCRIPTION_TOKEN = 'sk-ant-oat01-UPDATE-HEALTH-INERT-NOT-A-REAL-CREDENTIAL';
 const VERSIONS = { sdk: '0.3.295', cli: '2.1.295' };
@@ -38,12 +40,14 @@ async function contentsFixture(callback) {
   await mkdir(sdk, { recursive: true });
   const runtimeFile = path.join(sdk, 'vm-text-chat.mjs');
   await writeFile(runtimeFile, 'export {};\n');
+  const protocolFile = path.join(sdk, 'deepseek-text-chat.mjs');
+  await writeFile(protocolFile, "export const TEXT_IDENTITY_CONTRACT = 'app-install-conversation/v1';\n");
   const baseFile = path.join(contentsRoot, 'Resources', 'Runtime', 'host', 'text-runtime', 'images', 'base.json');
   await mkdir(path.dirname(baseFile), { recursive: true });
   await writeFile(baseFile, JSON.stringify({ schema: 'claude-text-vm-base/v1',
     sdk_version: VERSIONS.sdk, cli_version: VERSIONS.cli }));
   try {
-    return await callback({ root, contentsRoot, sdk, runtimeFile, baseFile,
+    return await callback({ root, contentsRoot, sdk, runtimeFile, protocolFile, baseFile,
       input: { schema: HEALTH_SCHEMA, contentsRoot } });
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -58,7 +62,7 @@ function deferred() {
 
 function runtimeFixture(options = {}) {
   const observed = { launches: 0, runs: 0, input: null, inputs: [], outbound: [], sse: '', sses: [],
-    dependencies: [], children: [], originalWrites: [], stdinWrites: [], sessions: [], cleanups: 0, cleaned: false };
+    dependencies: [], children: [], originalWrites: [], stdinWrites: [], sessions: [], cleanups: 0, cleaned: false, launchArguments: [] };
   let child;
   const makeChild = () => {
     const value = new EventEmitter();
@@ -69,23 +73,27 @@ function runtimeFixture(options = {}) {
     value.stdin.on('data', bytes => writes.push(Buffer.from(bytes).toString('utf8')));
     return value;
   };
-  const productionLauncher = async () => {
+  const productionLauncher = async (...arguments_) => {
     observed.launches++;
+    observed.launchArguments.push(arguments_);
     child ??= makeChild();
     return child;
   };
   const runVMTextChat = async (input, emit, dependencies) => {
     child = makeChild();
     const selected = (!options.targetProvider || input.provider === options.targetProvider) &&
-      (!options.targetModel || input.model === options.targetModel) ? options : {};
+      (!options.targetModel || input.model === options.targetModel) &&
+      (options.targetProject === undefined || Boolean(input.project) === options.targetProject) ? options : {};
     const versions = options.versions ?? VERSIONS;
-    const sessionID = randomUUID(); observed.sessions.push(sessionID);
+    const nativeIdentity = { ...(selected.ignoreIdentity ? {} : input.identity), ...selected.nativeIdentityChange };
+    const sessionID = nativeIdentity.session_id ?? randomUUID(); observed.sessions.push(sessionID);
+    const deviceID = nativeIdentity.device_id ?? 'b'.repeat(64);
     const nativeModel = input.provider === 'claude-subscription' ? `claude-${input.model}-5-5` : input.model;
     observed.runs++;
     observed.input ??= input; observed.inputs.push(input); observed.dependencies.push(dependencies);
     if (selected.throwError) throw new Error('PRIVATE_RUNTIME_DIAGNOSTIC_MUST_NOT_LEAK');
     if (selected.earlyError) return { type: 'error', code: 'PRIVATE_PROVIDER_ERROR' };
-    if (!selected.noLaunch) await dependencies.launch();
+    if (!selected.noLaunch) await dependencies.launch('/synthetic/runtime', input.project);
     if (selected.doubleLaunch) await dependencies.launch();
     child.stdin.write(JSON.stringify({ kind: 'health-fixture', model: input.model,
       ...(selected.stdinCredential ? { private: input.apiKey ?? input.subscriptionToken } : {}) }) + '\n');
@@ -96,45 +104,91 @@ function runtimeFixture(options = {}) {
         child.stdout.write(bytes.subarray(index, index + (selected.frameChunkBytes ?? bytes.length)));
       }
     };
-    const init = { kind: 'native_init', model: nativeModel, session_id: sessionID, no_tools: true,
+    const init = { kind: 'native_init', model: nativeModel, session_id: sessionID, no_tools: !input.project,
+      ...(input.project ? { tools: PROJECT_TOOLS, project_mount: '/home/claude/project' } : {}),
       ...selected.initChange };
+    if (input.project && !selected.missingConfig) frame({ kind: 'vm_config', network_devices: 0,
+      host_directory_shares: 1, directory_shares: 1, clipboard_devices: 0, graphics_devices: 0,
+      socket_devices: 1, cpu_count: 2, memory_bytes: 2_147_483_648, disposable_disk: true, vsock_port: 40124,
+      project_mount: '/home/claude/project', project_read_only: false,
+      ...selected.configChange });
     if (!selected.missingInit) {
       frame(init);
       if (selected.doubleInit) frame(init);
     }
     const event = (type, fields = {}) => ({ schema: EVENT_SCHEMA, request_id: input.request_id,
       model: input.model, fixture_only: false, type, ...fields, ...selected.eventChange });
-    if (!selected.missingStarted) emit(event('started', { no_tools: true }));
-    if (selected.doubleStarted) emit(event('started', { no_tools: true }));
+    if (!selected.missingStarted) emit(event('started', { no_tools: !input.project }));
+    if (selected.doubleStarted) emit(event('started', { no_tools: !input.project }));
+    let requestCount = 0;
     if (!selected.noTransport) {
       const subscription = input.provider === 'claude-subscription';
-      let parameters = { provider: input.provider, apiKey: input.apiKey, subscriptionToken: input.subscriptionToken,
-        headers: subscription ? {
-          'anthropic-version': '2023-06-01', 'x-app': 'cli',
-          'user-agent': `claude-cli/${versions.cli} (external, sdk-ts, agent-sdk/${versions.sdk})`,
-          'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,mid-conversation-system-2026-04-07',
-          'x-claude-code-session-id': sessionID, 'anthropic-dangerous-direct-browser-access': 'true',
-        } : {}, network: input.network, signal: dependencies.signal,
-        body: { model: subscription ? nativeModel : 'deepseek-flash', stream: true, max_tokens: 4096,
-          thinking: { type: 'disabled' }, tools: [], system: subscription ? [
-            { type: 'text', text: `x-anthropic-billing-header: cc_version=${versions.cli}.c4e; cc_entrypoint=sdk-ts;` },
-            { type: 'text', text: IDENTITY }, { type: 'text', text: SYSTEM },
-          ] : SYSTEM,
-          messages: [{ role: 'user', content: input.messages[0].text }],
-          ...(subscription ? { metadata: { user_id: JSON.stringify({ device_id: 'b'.repeat(64),
-            account_uuid: '', session_id: sessionID }) } } : {}) },
-        ...selected.transportChange };
-      if (selected.bodyChange) parameters.body = { ...parameters.body, ...selected.bodyChange };
-      if (selected.headersChange) parameters.headers = { ...parameters.headers, ...selected.headersChange };
-      if (selected.requestChange) parameters = selected.requestChange(parameters, input);
-      const upstream = await dependencies.transport(parameters);
-      observed.outbound.push(parameters);
-      assert.equal(upstream.statusCode, 200);
-      assert.match(upstream.contentType, /^text\/event-stream(?:;|$)/);
-      let sse = '';
-      for await (const bytes of upstream.stream) sse += Buffer.from(bytes).toString('utf8');
-      observed.sses.push(sse); observed.sse += sse;
-      if (selected.doubleTransport) await dependencies.transport(parameters);
+      const system = input.project ? PROJECT_SYSTEM : SYSTEM;
+      const messages = [{ role: 'user', content: input.messages[0].text }];
+      for (let turn = 0; turn < (input.project ? 7 : 1); turn++) {
+        let parameters = { provider: input.provider, apiKey: input.apiKey, subscriptionToken: input.subscriptionToken,
+          headers: subscription ? {
+            'anthropic-version': '2023-06-01', 'x-app': 'cli',
+            'user-agent': `claude-cli/${versions.cli} (external, sdk-ts, agent-sdk/${versions.sdk})`,
+            'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,mid-conversation-system-2026-04-07',
+            'x-claude-code-session-id': sessionID, 'anthropic-dangerous-direct-browser-access': 'true',
+          } : {}, network: input.network, signal: dependencies.signal,
+          body: { model: subscription ? nativeModel : 'deepseek-flash', stream: true, max_tokens: 4096,
+            thinking: { type: 'disabled' }, tools: input.project ? PROJECT_TOOLS.map(name =>
+              ({ name, description: name, input_schema: { type: 'object', properties: {} } })) : [], system: subscription ? [
+              { type: 'text', text: `x-anthropic-billing-header: cc_version=${versions.cli}.c4e; cc_entrypoint=sdk-ts;` },
+              { type: 'text', text: IDENTITY }, { type: 'text', text: system },
+            ] : system,
+            messages: structuredClone(messages),
+            ...(subscription ? { metadata: { user_id: JSON.stringify({ device_id: deviceID,
+              account_uuid: '', session_id: sessionID }) } } : {}) },
+          ...selected.transportChange };
+        if (selected.bodyChange) parameters.body = { ...parameters.body, ...selected.bodyChange };
+        if (selected.headersChange) parameters.headers = { ...parameters.headers, ...selected.headersChange };
+        if (selected.requestChange) parameters = selected.requestChange(parameters, input);
+        const upstream = await dependencies.transport(parameters);
+        requestCount++;
+        observed.outbound.push(parameters);
+        assert.equal(upstream.statusCode, 200);
+        assert.match(upstream.contentType, /^text\/event-stream(?:;|$)/);
+        let sse = '';
+        for await (const bytes of upstream.stream) sse += Buffer.from(bytes).toString('utf8');
+        observed.sses.push(sse); observed.sse += sse;
+        if (selected.doubleTransport) await dependencies.transport(parameters);
+        if (input.project && turn < 6) {
+          const frames = sse.split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6)));
+          const tool = frames.find(value => value.type === 'content_block_start').content_block;
+          tool.input = JSON.parse(frames.find(value => value.type === 'content_block_delta').delta.partial_json);
+          if (selected.nativeSDKEditDefaults && tool.name === 'Edit' && !Object.hasOwn(tool.input, 'replace_all')) {
+            tool.input.replace_all = false;
+          }
+          const activity = phase => event('tool_activity', { tool_id: tool.id, tool: tool.name,
+            phase, ...selected.activityChange });
+          if (!selected.missingActivity) emit(activity('started'));
+          let content = 'Synthetic project operation completed.';
+          const filename = path.join(input.project.directory, tool.name === 'Bash' ? 'bash.txt' :
+            ['Glob', 'Grep'].includes(tool.name) ? 'output.txt' : path.basename(tool.input.file_path));
+          if (tool.name === 'Read') content = await readFile(filename, 'utf8');
+          else if (tool.name === 'Glob') {
+            if (!selected.skipProjectWrites) await lstat(filename);
+            content = '/home/claude/project/output.txt';
+          }
+          else if (tool.name === 'Grep') content = selected.skipProjectWrites ? 'RUNTIME_PROJECT_WRITTEN\n' : await readFile(filename, 'utf8');
+          else if (!selected.skipProjectWrites) {
+            if (tool.name === 'Edit') await writeFile(filename, (await readFile(filename, 'utf8')).replace(tool.input.old_string, tool.input.new_string));
+            else if (tool.name === 'Write') await writeFile(filename, tool.input.content);
+            else { content = 'RUNTIME_PROJECT_BASH_OK\n'; await writeFile(filename, content); }
+          }
+          if (tool.name === 'Bash') content = 'RUNTIME_PROJECT_BASH_OK\n';
+          if (!selected.missingActivity) emit(activity(selected.failedActivity ? 'failed' : 'completed'));
+          messages.push({ role: 'assistant', content: [tool] }, { role: 'user', content: [
+            { type: 'tool_result', tool_use_id: tool.id, content, ...selected.toolResultChange,
+              ...selected.toolResultByName?.[tool.name] },
+          ] });
+        }
+      }
+      if (input.project && selected.removeProject) await rm(input.project.directory, { recursive: true });
+      if (input.project && selected.corruptOutside) await writeFile(path.join(input.project.directory, '..', 'outside.txt'), 'changed');
     }
     if (!selected.missingDelta) emit(event('delta', { text: selected.deltaText ?? ACK }));
     if (!selected.missingStop) frame({ kind: 'vm_stopped', cleanup_complete: true, ...selected.stopChange });
@@ -143,8 +197,8 @@ function runtimeFixture(options = {}) {
     child.stdout.end();
     child.stderr.end();
     observed.cleanups++; observed.cleaned = true;
-    const terminal = event('completed', { text: ACK, no_tools: true, cli_exit: 0, cli_signal: null,
-      temporary_removed: true, proxy_closed: true, request_count: 1, ...selected.terminalChange });
+    const terminal = event('completed', { text: ACK, no_tools: !input.project, cli_exit: 0, cli_signal: null,
+      temporary_removed: true, proxy_closed: true, request_count: requestCount, ...selected.terminalChange });
     if (!selected.missingCompleted) emit(terminal);
     if (selected.doubleCompleted) emit(terminal);
     return terminal;
@@ -156,6 +210,13 @@ async function runFixture(input, options = {}, probeOptions = {}) {
   const fixture = runtimeFixture(options);
   const result = await runHealthProbe(input, { testOnly: true, runtimeModule: fixture.module,
     timeoutMs: 1000, ...probeOptions });
+  if (result.type === 'error') {
+    // These runtime objects are in-process fakes, so no VM can still own their
+    // synthetic trees when a deliberately broken cleanup receipt is tested.
+    for (const value of fixture.observed.inputs) {
+      if (value.project) await rm(path.dirname(value.project.directory), { recursive: true, force: true });
+    }
+  }
   return { ...fixture, result };
 }
 
@@ -169,7 +230,7 @@ test('health requires all four isolated native text gates, bounded transport and
     assert.equal(fixture.observed.cleaned, true);
     assert.equal(fixture.observed.outbound.length, 4);
     assert.equal(new Set(fixture.observed.children).size, 4);
-    assert.equal(new Set(fixture.observed.sessions).size, 4);
+    assert.equal(new Set(fixture.observed.sessions).size, 2, 'subscription model gates share one stable conversation');
     assert.deepEqual(fixture.observed.inputs.map(({ provider, model, request_id }) => ({ provider, model, request_id })), GATES);
     const runtimeInput = fixture.observed.input;
     assert.equal(runtimeInput.schema, 'deepseek-text-chat/v1');
@@ -181,6 +242,7 @@ test('health requires all four isolated native text gates, bounded transport and
     assert.equal(typeof runtimeInput.messages[0].text, 'string');
     assert.ok(runtimeInput.messages[0].text.includes(ACK));
     assert.equal(runtimeInput.subscriptionToken, undefined);
+    assert.equal(Object.hasOwn(runtimeInput, 'identity'), false, 'DeepSeek must not receive a subscription identity');
     assert.deepEqual(runtimeInput.text_skills, []);
     assert.deepEqual(runtimeInput.network, { schema: 'app-network-policy/v1', proxyURL: 'http://127.0.0.1:1', dnsPolicy: 'proxy-only' });
     assert.deepEqual(runtimeInput.runtime, { schema: 'app-runtime-profile/v1', timeZone: 'UTC', language: 'en' });
@@ -202,6 +264,11 @@ test('health requires all four isolated native text gates, bounded transport and
       if (index === 0) continue;
       assert.equal(input.apiKey, undefined);
       assert.equal(input.subscriptionToken, SUBSCRIPTION_TOKEN);
+      assert.deepEqual(input.identity, fixture.observed.inputs[1].identity);
+      assert.deepEqual(Object.keys(input.identity).sort(), ['device_id', 'session_id']);
+      assert.match(input.identity.device_id, /^[a-f0-9]{64}$/);
+      assert.match(input.identity.session_id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+      assert.equal(fixture.observed.sessions[index], input.identity.session_id);
       assert.deepEqual(Object.keys(outbound.headers).sort(), [...SUBSCRIPTION_HEADERS].sort());
       assert.equal(outbound.headers['x-claude-code-session-id'], fixture.observed.sessions[index]);
       assert.equal(outbound.headers['user-agent'], `claude-cli/${VERSIONS.cli} (external, sdk-ts, agent-sdk/${VERSIONS.sdk})`);
@@ -210,8 +277,7 @@ test('health requires all four isolated native text gates, bounded transport and
         { type: 'text', text: `x-anthropic-billing-header: cc_version=${VERSIONS.cli}.c4e; cc_entrypoint=sdk-ts;` },
         { type: 'text', text: IDENTITY }, { type: 'text', text: SYSTEM },
       ]);
-      assert.deepEqual(JSON.parse(outbound.body.metadata.user_id), { device_id: 'b'.repeat(64),
-        account_uuid: '', session_id: fixture.observed.sessions[index] });
+      assert.deepEqual(JSON.parse(outbound.body.metadata.user_id), { ...input.identity, account_uuid: '' });
     }
   });
 });
@@ -303,6 +369,10 @@ test('candidate versions determine subscription user-agent and billing markers f
 });
 
 const subscriptionFailures = [
+  ['native ignores the supplied identity consistently', { ignoreIdentity: true }],
+  ['native substitutes a consistent session', { nativeIdentityChange: { session_id: SESSION_ID } }],
+  ['native substitutes a valid device', { nativeIdentityChange: { device_id: 'c'.repeat(64) } }],
+  ['native init disagrees with the requested session', { initChange: { session_id: SESSION_ID } }],
   ['missing OAuth beta', { headersChange: { 'anthropic-beta': 'claude-code-20250219' } }],
   ['missing CLI beta', { headersChange: { 'anthropic-beta': 'oauth-2025-04-20' } }],
   ['unknown beta', { headersChange: { 'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,untrusted-20260101' } }],
@@ -365,6 +435,169 @@ test('subscription health permits the existing bounded beta list for each model'
     assert.deepEqual(fixture.observed.outbound.slice(1).map(value => value.headers['anthropic-beta']), [beta, beta, beta]);
   });
 });
+
+test('repeated health probes retain the same inert subscription installation and conversation', async () => {
+  await contentsFixture(async ({ input }) => {
+    const first = await runFixture(input), second = await runFixture(input);
+    assert.deepEqual(first.result, { type: 'healthy' });
+    assert.deepEqual(second.result, { type: 'healthy' });
+    assert.deepEqual(second.observed.inputs.slice(1).map(value => value.identity),
+      first.observed.inputs.slice(1).map(value => value.identity));
+  });
+});
+
+test('missing or incompatible candidate identity capability rejects before any native execution', async () => {
+  for (const source of ['export {};', ...[null, true, 'app-install-conversation/v0',
+    { version: 'app-install-conversation/v1' }].map(value => `export const TEXT_IDENTITY_CONTRACT = ${JSON.stringify(value)};`)]) {
+    await contentsFixture(async ({ input, protocolFile }) => {
+      await writeFile(protocolFile, source);
+      const fixture = await runFixture(input);
+      assert.deepEqual(fixture.result, ERROR);
+      assert.equal(fixture.observed.runs, 0);
+      assert.equal(fixture.observed.launches, 0);
+    });
+  }
+});
+
+async function declareProjectCapability(protocolFile, contract = 'selected-directory-rw/v1') {
+  await writeFile(protocolFile, `export const TEXT_IDENTITY_CONTRACT = 'app-install-conversation/v1';\n` +
+    `export const PROJECT_EXECUTION_CONTRACT = ${JSON.stringify(contract)};\n`);
+}
+
+test('declared project capability adds DeepSeek and Sonnet VM gates with tool execution and host readback', async () => {
+  await contentsFixture(async ({ input, protocolFile }) => {
+    await declareProjectCapability(protocolFile);
+    const fixture = await runFixture(input);
+    assert.deepEqual(fixture.result, { type: 'healthy' });
+    assert.equal(fixture.observed.runs, 6);
+    assert.equal(fixture.observed.launches, 6);
+    assert.equal(fixture.observed.cleanups, 6);
+    assert.equal(fixture.observed.outbound.length, 18);
+    const projectInputs = fixture.observed.inputs.slice(4);
+    assert.deepEqual(projectInputs.map(value => [value.provider, value.model]),
+      [['deepseek-api', 'deepseek-flash[1m]'], ['claude-subscription', 'sonnet']]);
+    for (const [index, projectInput] of projectInputs.entries()) {
+      assert.deepEqual(Object.keys(projectInput.project), ['directory']);
+      assert.ok(path.isAbsolute(projectInput.project.directory));
+      assert.deepEqual(fixture.observed.launchArguments[index + 4], ['/synthetic/runtime', projectInput.project]);
+      await assert.rejects(lstat(projectInput.project.directory), { code: 'ENOENT' }, 'health removes its own synthetic tree after VM stop');
+    }
+    assert.deepEqual(projectInputs[1].identity, fixture.observed.inputs[1].identity);
+    for (const request of fixture.observed.outbound.slice(4)) {
+      assert.deepEqual(request.body.tools.map(value => value.name), PROJECT_TOOLS);
+      assert.equal(JSON.stringify(request.body).includes(projectInputs[0].project.directory), false);
+      assert.equal(JSON.stringify(request.body).includes(projectInputs[1].project.directory), false);
+      for (const call of request.body.messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
+        .filter(block => block.type === 'tool_use' && block.name === 'Bash')) {
+        // Disabling native background tasks removes run_in_background from the
+        // official Bash schema. Omission is the supported foreground request.
+        assert.deepEqual(Object.keys(call.input), ['command']);
+      }
+    }
+  });
+});
+
+test('missing project capability retains the four text-only rollback gates', async () => {
+  await contentsFixture(async ({ input }) => {
+    const fixture = await runFixture(input);
+    assert.deepEqual(fixture.result, { type: 'healthy' });
+    assert.equal(fixture.observed.runs, 4);
+    assert.ok(fixture.observed.inputs.every(value => !Object.hasOwn(value, 'project')));
+  });
+});
+
+test('project health sends explicit Edit replace_all false and accepts the official SDK default', async () => {
+  await contentsFixture(async ({ input, protocolFile }) => {
+    await declareProjectCapability(protocolFile);
+    const fixture = await runFixture(input, { targetProject: true, nativeSDKEditDefaults: true });
+    assert.deepEqual(fixture.result, { type: 'healthy' });
+    const editRequests = fixture.observed.sses.map(sse => sse.split('\n').filter(line => line.startsWith('data: '))
+      .map(line => JSON.parse(line.slice(6))))
+      .filter(frames => frames.some(frame => frame.type === 'content_block_start' && frame.content_block.name === 'Edit'));
+    assert.equal(editRequests.length, 2);
+    for (const frames of editRequests) {
+      const input = JSON.parse(frames.find(frame => frame.type === 'content_block_delta').delta.partial_json);
+      assert.equal(Object.hasOwn(input, 'replace_all'), true);
+      assert.equal(input.replace_all, false);
+    }
+  });
+});
+
+test('each project health gate emits seven distinct native assistant message IDs', async () => {
+  await contentsFixture(async ({ input, protocolFile }) => {
+    await declareProjectCapability(protocolFile);
+    const fixture = await runFixture(input);
+    assert.deepEqual(fixture.result, { type: 'healthy' });
+    for (const offset of [4, 11]) {
+      const starts = fixture.observed.sses.slice(offset, offset + 7).map(sse => sse.split('\n')
+        .filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6)))
+        .filter(frame => frame.type === 'message_start'));
+      assert.equal(starts.length, 7);
+      assert.ok(starts.every(frames => frames.length === 1));
+      const ids = starts.map(frames => frames[0].message.id);
+      assert.ok(ids.every(id => typeof id === 'string' && id.length > 0));
+      assert.equal(new Set(ids).size, 7, 'SDK must not merge separate tool turns into one assistant message');
+    }
+  });
+});
+
+for (const contract of [undefined, null, true, 'selected-directory-rw/v0', { contract: 'selected-directory-rw/v1' }]) {
+  test(`incompatible declared project capability ${JSON.stringify(contract)} is rejected before VM launch`, async () => {
+    await contentsFixture(async ({ input, protocolFile }) => {
+      await writeFile(protocolFile, `export const TEXT_IDENTITY_CONTRACT = 'app-install-conversation/v1';\n` +
+        `export const PROJECT_EXECUTION_CONTRACT = ${JSON.stringify(contract)};\n`);
+      const fixture = await runFixture(input);
+      assert.deepEqual(fixture.result, ERROR);
+      assert.equal(fixture.observed.runs, 0);
+    });
+  });
+}
+
+const projectFailures = [
+  ['missing VM configuration', { missingConfig: true }],
+  ['VM network interface enabled', { configChange: { network_devices: 1 } }],
+  ['extra host directory share', { configChange: { directory_shares: 2 } }],
+  ['mismatched host directory share receipt', { configChange: { host_directory_shares: 2 } }],
+  ['clipboard device enabled', { configChange: { clipboard_devices: 1 } }],
+  ['graphics device enabled', { configChange: { graphics_devices: 1 } }],
+  ['non-disposable guest disk', { configChange: { disposable_disk: false } }],
+  ['wrong vsock port', { configChange: { vsock_port: 40123 } }],
+  ['read-only host directory share', { configChange: { project_read_only: true } }],
+  ['missing native tool declaration', { initChange: { tools: undefined } }],
+  ['extra native tool', { initChange: { tools: [...PROJECT_TOOLS, 'Agent'] } }],
+  ['wrong native mount', { initChange: { project_mount: '/home/claude/other' } }],
+  ['text-only native mode', { initChange: { no_tools: true } }],
+  ['missing tool activity', { missingActivity: true }],
+  ['failed tool activity', { failedActivity: true }],
+  ['unrecognized tool activity', { activityChange: { tool: 'Agent' } }],
+  ['failed tool result', { toolResultChange: { is_error: true } }],
+  ['wrong tool result attribution', { toolResultChange: { tool_use_id: 'toolu_unrelated' } }],
+  ['native Edit changes replace_all', { requestChange: parameters => {
+    for (const message of parameters.body.messages) {
+      for (const block of Array.isArray(message.content) ? message.content : []) {
+        if (block.type === 'tool_use' && block.name === 'Edit') block.input.replace_all = true;
+      }
+    }
+    return parameters;
+  } }],
+  ['Glob result does not match the written file', { toolResultByName: { Glob: { content: 'unrelated.txt' } } }],
+  ['Grep result does not contain the written content', { toolResultByName: { Grep: { content: 'No matches found' } } }],
+  ['missing tool schemas', { bodyChange: { tools: [] } }],
+  ['unperformed writes despite successful receipts', { skipProjectWrites: true }],
+  ['selected directory incorrectly removed by runtime', { removeProject: true }],
+  ['outside sentinel modified', { corruptOutside: true }],
+  ['text-only terminal receipt', { terminalChange: { no_tools: true } }],
+];
+for (const [name, options] of projectFailures) {
+  test(`project ${name} keeps capability health closed`, async () => {
+    await contentsFixture(async ({ input, protocolFile }) => {
+      await declareProjectCapability(protocolFile);
+      const fixture = await runFixture(input, { ...options, targetProject: true });
+      assert.deepEqual(fixture.result, ERROR);
+      assert.equal(fixture.observed.runs, 5);
+    });
+  });
+}
 
 test('each gate receives the remaining deadline budget', async () => {
   await contentsFixture(async ({ input }) => {
@@ -461,9 +694,9 @@ test('runtime injection and deadline overrides require explicit test-only admiss
   });
 });
 
-for (const location of ['ancestor', 'Contents', 'Resources', 'Runtime', 'sdk', 'vm-text-chat.mjs', 'host', 'text-runtime', 'images', 'base.json']) {
+for (const location of ['ancestor', 'Contents', 'Resources', 'Runtime', 'sdk', 'vm-text-chat.mjs', 'deepseek-text-chat.mjs', 'host', 'text-runtime', 'images', 'base.json']) {
   test(`a symlink at ${location} rejects before runtime execution`, async () => {
-    await contentsFixture(async ({ root, contentsRoot, sdk, runtimeFile, baseFile, input }) => {
+    await contentsFixture(async ({ root, contentsRoot, sdk, runtimeFile, protocolFile, baseFile, input }) => {
       let candidate = contentsRoot;
       if (location === 'ancestor') {
         const link = path.join(root, 'Linked.app');
@@ -473,6 +706,7 @@ for (const location of ['ancestor', 'Contents', 'Resources', 'Runtime', 'sdk', '
         const target = location === 'Contents' ? contentsRoot : location === 'Resources' ?
           path.join(contentsRoot, 'Resources') : location === 'Runtime' ?
             path.join(contentsRoot, 'Resources', 'Runtime') : location === 'sdk' ? sdk : location === 'vm-text-chat.mjs' ? runtimeFile :
+              location === 'deepseek-text-chat.mjs' ? protocolFile :
               location === 'base.json' ? baseFile : path.join(contentsRoot, 'Resources', 'Runtime', 'host',
                 ...(location === 'host' ? [] : location === 'text-runtime' ? ['text-runtime'] : ['text-runtime', 'images']));
         const real = target + '.real';
@@ -487,18 +721,21 @@ for (const location of ['ancestor', 'Contents', 'Resources', 'Runtime', 'sdk', '
   });
 }
 
-test('a missing runtime or a directory in place of its module rejects before execution', async () => {
-  await contentsFixture(async ({ input, runtimeFile }) => {
-    await rm(runtimeFile);
-    const missing = await runFixture(input);
-    assert.deepEqual(missing.result, ERROR);
-    assert.equal(missing.observed.runs, 0);
-    await mkdir(runtimeFile);
-    const directory = await runFixture(input);
-    assert.deepEqual(directory.result, ERROR);
-    assert.equal(directory.observed.runs, 0);
+for (const moduleFile of ['runtimeFile', 'protocolFile']) {
+  test(`a missing ${moduleFile} or a directory in its place rejects before execution`, async () => {
+    await contentsFixture(async fixture => {
+      const { input } = fixture, filename = fixture[moduleFile];
+      await rm(filename);
+      const missing = await runFixture(input);
+      assert.deepEqual(missing.result, ERROR);
+      assert.equal(missing.observed.runs, 0);
+      await mkdir(filename);
+      const directory = await runFixture(input);
+      assert.deepEqual(directory.result, ERROR);
+      assert.equal(directory.observed.runs, 0);
+    });
   });
-});
+}
 
 test('an already cancelled probe never launches the VM', async () => {
   await contentsFixture(async ({ input }) => {

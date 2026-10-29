@@ -6,19 +6,75 @@ enum RuntimeError: Error {
     case invalid(String)
 }
 
+final class SelectedProjectDirectory {
+    let url: URL
+    private(set) var descriptor: Int32
+    let device: Int64
+    let inode: UInt64
+
+    init(path: String, device: Int64, inode: UInt64) throws {
+        guard path.hasPrefix("/"), !path.contains("\0"), !path.split(separator: "/").contains("..") else {
+            throw RuntimeError.invalid("project_directory_path")
+        }
+        let url = URL(fileURLWithPath: path, isDirectory: true)
+        guard Self.canonicalPath(path) == path else {
+            throw RuntimeError.invalid("project_directory_canonical")
+        }
+        let descriptor = Darwin.open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { throw RuntimeError.invalid("project_directory_open") }
+        self.url = url
+        self.descriptor = descriptor
+        self.device = device
+        self.inode = inode
+        // A retained descriptor and before/after identity checks reject path
+        // replacement; no permissions or content in the selected tree change.
+        do { try verify() } catch {
+            Darwin.close(descriptor)
+            self.descriptor = -1
+            throw error
+        }
+    }
+
+    func verify() throws {
+        var opened = stat()
+        var current = stat()
+        guard Darwin.fstat(descriptor, &opened) == 0, Darwin.lstat(url.path, &current) == 0,
+              current.st_mode & S_IFMT == S_IFDIR,
+              Int64(current.st_dev) == device, UInt64(current.st_ino) == inode,
+              Int64(opened.st_dev) == device, UInt64(opened.st_ino) == inode,
+              Self.canonicalPath(url.path) == url.path,
+              Darwin.access(url.path, R_OK | W_OK | X_OK) == 0 else {
+            throw RuntimeError.invalid("project_directory_changed_or_inaccessible")
+        }
+    }
+
+    private static func canonicalPath(_ path: String) -> String? {
+        // Foundation deliberately rewrites /private/tmp to /tmp; use POSIX
+        // canonicalization to match the launcher's actual filesystem identity.
+        guard let resolved = Darwin.realpath(path, nil) else { return nil }
+        defer { Darwin.free(resolved) }
+        return String(cString: resolved)
+    }
+
+    deinit { if descriptor >= 0 { Darwin.close(descriptor) } }
+}
+
 // The only host/guest channel accepts bounded JSON objects; it is never a socket
 // forwarder, host file service, shell, or arbitrary provider transport.
 final class TextPump: @unchecked Sendable {
     static let maxFrame = 1024 * 1024
     static let maxStream = 32 * 1024 * 1024
+    static let maxProjectStream = 64 * 1024 * 1024
+    let streamLimit: Int
     let descriptor: Int32
     let lock = NSLock()
     var stopped = false
     var resultSeen = false
     let completion: @Sendable (String, Bool) -> Void
 
-    init(descriptor: Int32, completion: @escaping @Sendable (String, Bool) -> Void) {
+    init(descriptor: Int32, projectEnabled: Bool = false, completion: @escaping @Sendable (String, Bool) -> Void) {
         self.descriptor = descriptor
+        self.streamLimit = projectEnabled ? Self.maxProjectStream : Self.maxStream
         self.completion = completion
     }
 
@@ -46,7 +102,7 @@ final class TextPump: @unchecked Sendable {
         var total = 0
         var buffer = [UInt8](repeating: 0, count: 16 * 1024)
         let allowed: Set<String> = guestToHost
-            ? ["ready", "native_init", "provider_request", "result", "privacy", "runtime_error"]
+            ? ["ready", "native_init", "provider_request", "tool_activity", "result", "privacy", "runtime_error"]
             : ["start", "provider_response", "provider_chunk", "provider_end", "cancel"]
         while !lock.withLock({ stopped }) {
             let count = Darwin.read(source, &buffer, buffer.count)
@@ -59,7 +115,7 @@ final class TextPump: @unchecked Sendable {
                 stop("channel_read_failed"); return
             }
             total += count
-            guard total <= Self.maxStream else { stop("stream_limit"); return }
+            guard total <= streamLimit else { stop("stream_limit"); return }
             partial.append(contentsOf: buffer.prefix(count))
             while let newline = partial.firstIndex(of: 10) {
                 let frame = Data(partial[..<newline])
@@ -106,6 +162,8 @@ final class TextRuntime: NSObject, @preconcurrency VZVirtualMachineDelegate, @pr
     var finished = false
     var accepted = false
     var preparation = false
+    var project: SelectedProjectDirectory?
+    var projectReady = false
     var pendingStop: (Int32, String)?
 
     func emit(_ object: [String: Any], stdout: Bool = false) {
@@ -121,13 +179,19 @@ final class TextRuntime: NSObject, @preconcurrency VZVirtualMachineDelegate, @pr
                   "network_devices": 0, "host_directory_shares": 0], stdout: true)
             exit(VZVirtualMachine.isSupported ? 0 : 2)
         }
-        guard (args.count == 5 || args.count == 6), args[0] == "boot",
+        guard [5, 6, 9].contains(args.count), args[0] == "boot",
               let timeout = Double(args[4]), timeout >= 30, timeout <= 600,
-              args.count == 5 || args[5] == "prepare" else {
+              args.count == 5 || args.count == 6 && args[5] == "prepare" || args.count == 9 && args[5] == "project" else {
             throw RuntimeError.invalid("arguments")
         }
         guard VZVirtualMachine.isSupported else { throw RuntimeError.invalid("virtualization_unavailable") }
         preparation = args.count == 6
+        if args.count == 9 {
+            guard let device = Int64(args[7]), let inode = UInt64(args[8]) else {
+                throw RuntimeError.invalid("project_directory_identity")
+            }
+            project = try SelectedProjectDirectory(path: args[6], device: device, inode: inode)
+        }
         let directory = URL(fileURLWithPath: args[1], isDirectory: true)
         let kernel = directory.appendingPathComponent("kernel")
         let initrd = directory.appendingPathComponent("initrd")
@@ -152,6 +216,12 @@ final class TextRuntime: NSObject, @preconcurrency VZVirtualMachineDelegate, @pr
         config.memorySize = 2 * 1024 * 1024 * 1024
         config.networkDevices = []
         config.directorySharingDevices = []
+        if let project {
+            try project.verify()
+            let sharing = VZVirtioFileSystemDeviceConfiguration(tag: "claude-project")
+            sharing.share = VZSingleDirectoryShare(directory: VZSharedDirectory(url: project.url, readOnly: false))
+            config.directorySharingDevices = [sharing]
+        }
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         config.socketDevices = preparation ? [] : [VZVirtioSocketDeviceConfiguration()]
         let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
@@ -162,14 +232,20 @@ final class TextRuntime: NSObject, @preconcurrency VZVirtualMachineDelegate, @pr
             VZVirtioBlockDeviceConfiguration(attachment: VZDiskImageStorageDeviceAttachment(url: seed, readOnly: true))
         ]
         try config.validate()
+        try project?.verify()
         installSignals()
-        emit(["kind": "vm_config", "network_devices": config.networkDevices.count,
+        var configuration: [String: Any] = ["kind": "vm_config", "network_devices": config.networkDevices.count,
               "host_directory_shares": config.directorySharingDevices.count,
               "directory_shares": config.directorySharingDevices.count,
               "clipboard_devices": 0, "graphics_devices": config.graphicsDevices.count,
               "socket_devices": config.socketDevices.count, "cpu_count": config.cpuCount,
               "memory_bytes": config.memorySize, "disposable_disk": true,
-              "vsock_port": preparation ? 0 : Self.port], stdout: !preparation)
+              "vsock_port": preparation ? 0 : Self.port]
+        if project != nil {
+            configuration["project_mount"] = "/home/claude/project"
+            configuration["project_read_only"] = false
+        }
+        emit(configuration, stdout: !preparation)
         let machine = VZVirtualMachine(configuration: config)
         machine.delegate = self
         vm = machine
@@ -183,10 +259,15 @@ final class TextRuntime: NSObject, @preconcurrency VZVirtualMachineDelegate, @pr
         deadline = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.stop(code: 3, reason: "timeout") }
         }
+        try project?.verify()
         machine.start { result in
             MainActor.assumeIsolated {
                 switch result {
                 case .success:
+                    do { try self.project?.verify() } catch {
+                        self.stop(code: 2, reason: "project_directory_changed"); return
+                    }
+                    self.projectReady = true
                     self.emit(["kind": "vm_started"])
                     if let (code, reason) = self.pendingStop { self.stop(code: code, reason: reason) }
                 case .failure: self.stop(code: 2, reason: "vm_start_failed")
@@ -197,7 +278,7 @@ final class TextRuntime: NSObject, @preconcurrency VZVirtualMachineDelegate, @pr
 
     func listener(_ listener: VZVirtioSocketListener, shouldAcceptNewConnection connection: VZVirtioSocketConnection,
                   from socketDevice: VZVirtioSocketDevice) -> Bool {
-        guard !finished, !accepted, connection.destinationPort == Self.port, connection.fileDescriptor >= 0 else { return false }
+        guard !finished, !accepted, projectReady, connection.destinationPort == Self.port, connection.fileDescriptor >= 0 else { return false }
         let fd = Darwin.dup(connection.fileDescriptor)
         guard fd >= 0, fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 else {
             if fd >= 0 { _ = Darwin.close(fd) }
@@ -209,7 +290,7 @@ final class TextRuntime: NSObject, @preconcurrency VZVirtualMachineDelegate, @pr
         }
         accepted = true
         self.connection = connection
-        let pump = TextPump(descriptor: fd) { [weak self] reason, resultSeen in
+        let pump = TextPump(descriptor: fd, projectEnabled: project != nil) { [weak self] reason, resultSeen in
             Task { @MainActor in
                 self?.stop(code: resultSeen && ["guest_eof", "stdin_eof"].contains(reason) ? 0 : 2, reason: reason)
             }
@@ -273,6 +354,9 @@ let runner = TextRuntime()
 do {
     try runner.start(Array(CommandLine.arguments.dropFirst()))
     RunLoop.main.run()
+} catch RuntimeError.invalid(let reason) {
+    runner.emit(["kind": "vm_error", "error_code": "configuration_failed", "reason": reason])
+    exit(2)
 } catch {
     runner.emit(["kind": "vm_error", "error_code": "configuration_failed"])
     exit(2)

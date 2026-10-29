@@ -8,6 +8,8 @@ final class ConversationViewModel: ObservableObject {
     @Published private(set) var conversations: [ConversationRecord] = []
     @Published var selectedID: UUID?
     @Published private(set) var persistenceError: String?
+    @Published private(set) var diagnosticError: String?
+    @Published private var projectDirectoryErrors: [UUID: String] = [:]
     @Published private(set) var translatingMessageIDs: Set<UUID> = []
     @Published private var activeConversationID: UUID?
     @Published private var status: String?
@@ -24,6 +26,13 @@ final class ConversationViewModel: ObservableObject {
     private let subscriptionCredentials: any AppCredentialStoring
     private let fixtureOnly: Bool
     private let skills: SkillsViewModel?
+    private let diagnostics: DiagnosticsSettingsModel
+    private let diagnosticNow: () -> Date
+    private var traceExpiryTask: Task<Void, Never>?
+    private var pendingBodyCleanup = false
+    private var activeTraceRequests: [String: (trace: ChatRequestTrace, capturedAt: Date)] = [:]
+    private var captureBodiesForActiveRun = false
+    private var bodyClearedForActiveRun = false
     private var canPersist = true
     private var saveTask: Task<Void, Never>?
     private var runTask: Task<Void, Never>?
@@ -32,6 +41,8 @@ final class ConversationViewModel: ObservableObject {
     private var activeUserID: UUID?
     private var activeAssistantID: UUID?
     private var activeOriginal = ""
+    private var activeProjectDirectory: String?
+    private var activeToolActivities: [String: (tool: String, messageID: UUID)] = [:]
 
     init(translation: TranslationViewModel, execution: ExecutionViewModel,
          translator: any TranslationProviding, provider: any ChatProviding,
@@ -39,13 +50,16 @@ final class ConversationViewModel: ObservableObject {
          translationCredentials: any AppCredentialStoring = FileCredentialStore(scope: .translation),
          executionCredentials: any AppCredentialStoring = FileCredentialStore(scope: .execution),
          subscriptionCredentials: any AppCredentialStoring = FileCredentialStore(scope: .subscription),
-         fixtureOnly: Bool = false, skills: SkillsViewModel? = nil) {
+         fixtureOnly: Bool = false, skills: SkillsViewModel? = nil,
+         diagnostics: DiagnosticsSettingsModel? = nil, diagnosticNow: @escaping () -> Date = Date.init) {
         self.translation = translation; self.execution = execution
         self.translator = translator; self.provider = provider; self.store = store
         self.translationCredentials = translationCredentials; self.executionCredentials = executionCredentials
         self.subscriptionCredentials = subscriptionCredentials
         self.fixtureOnly = fixtureOnly
         self.skills = skills
+        self.diagnostics = diagnostics ?? DiagnosticsSettingsModel()
+        self.diagnosticNow = diagnosticNow
         do {
             let snapshot = try store.load()
             try snapshot.validate()
@@ -67,7 +81,10 @@ final class ConversationViewModel: ObservableObject {
             persistenceError = (error as? ConversationStoreFailure)?.message ?? "无法读取会话文件，原文件已保留。本次会话仅保存在内存中。"
         }
         if conversations.isEmpty { let record = ConversationRecord(); conversations = [record]; selectedID = record.id }
+        expireRequestBodies()
     }
+
+    deinit { traceExpiryTask?.cancel() }
 
     var selectedConversation: ConversationRecord? { conversations.first { $0.id == selectedID } }
     var messages: [ConversationMessage] { selectedConversation?.messages ?? [] }
@@ -90,6 +107,32 @@ final class ConversationViewModel: ObservableObject {
     var isCurrentConversationBusy: Bool { isBusy && activeConversationID == selectedID }
     var canSend: Bool { !isWorkSuspended && !isBusy && selectedID != nil && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     var activityStatus: String? { isCurrentConversationBusy ? status : nil }
+    var projectDirectoryError: String? { selectedID.flatMap { projectDirectoryErrors[$0] } }
+    var canChangeProjectDirectory: Bool { selectedID.map { canChangeProjectDirectory(in: $0) } ?? false }
+
+    func canChangeProjectDirectory(in id: UUID) -> Bool {
+        !isWorkSuspended && conversations.contains { $0.id == id } && !(isBusy && activeConversationID == id)
+    }
+
+    /// The picker passes its original session ID even if the selection changes while it is open.
+    @discardableResult
+    func setProjectDirectory(_ path: String?, for id: UUID) -> Bool {
+        guard conversations.contains(where: { $0.id == id }) else { return false }
+        guard canChangeProjectDirectory(in: id) else {
+            projectDirectoryErrors[id] = "此会话正在执行或停止中，结束后才能更换执行目录。"
+            return false
+        }
+        do {
+            let normalized = try path.map { try ProjectDirectory.normalized($0) }
+            mutate(id) { $0.projectDirectory = normalized }
+            projectDirectoryErrors.removeValue(forKey: id)
+            flushPersistence()
+            return true
+        } catch {
+            projectDirectoryErrors[id] = errorMessage(error)
+            return false
+        }
+    }
 
     func newConversation() {
         guard !isWorkSuspended else { return }
@@ -115,15 +158,32 @@ final class ConversationViewModel: ObservableObject {
             translatingMessageIDs.remove(message.id)
         }
         conversations.removeAll { $0.id == id }
+        projectDirectoryErrors.removeValue(forKey: id)
         if selectedID == id { selectedID = conversations.first?.id }
         if conversations.isEmpty { newConversation() } else { flushPersistence() }
     }
 
     func send() {
         guard canSend, let record = selectedConversation else { return }
+        let project: ChatProject?
+        do {
+            project = try record.projectDirectory.map { directory in
+                try validateBoundProjectDirectory(directory)
+                return ChatProject(directory: directory)
+            }
+            projectDirectoryErrors.removeValue(forKey: record.id)
+        } catch {
+            projectDirectoryErrors[record.id] = errorMessage(error)
+            return
+        }
         let token = UUID(), userID = UUID(), original = record.draft
         activeToken = token; activeConversationID = record.id; activeUserID = userID
         activeAssistantID = nil; activeOriginal = original; status = "正在翻译输入…"
+        activeProjectDirectory = project?.directory
+        activeToolActivities.removeAll()
+        captureBodiesForActiveRun = diagnostics.captureBodies
+        bodyClearedForActiveRun = false
+        activeTraceRequests.removeAll()
         mutate(record.id) {
             $0.draft = ""
             if $0.title == "新会话" { $0.title = String(original.trimmingCharacters(in: .whitespacesAndNewlines).prefix(36)) }
@@ -151,7 +211,15 @@ final class ConversationViewModel: ObservableObject {
                     throw ChatFailure.code("INVALID_PROFILE")
                 }
                 do {
-                    subscriptionToken = execution.subscriptionToken.isEmpty ? try subscriptionCredentials.load() : execution.subscriptionToken
+                    if let accounts = execution.subscriptionAccounts {
+                        subscriptionToken = try accounts.currentSelection().token
+                    } else {
+                        subscriptionToken = execution.subscriptionToken.isEmpty ? try subscriptionCredentials.load() : execution.subscriptionToken
+                    }
+                } catch SubscriptionAccountSelectionFailure.missingAccount {
+                    throw ChatFailure.code("SUBSCRIPTION_ACCOUNT_REQUIRED")
+                } catch SubscriptionAccountSelectionFailure.missingCredential {
+                    throw ChatFailure.code("MISSING_SUBSCRIPTION_TOKEN")
                 } catch { throw ChatFailure.code("CREDENTIAL_STORE_UNAVAILABLE") }
                 guard let subscriptionToken else { throw ChatFailure.code("MISSING_SUBSCRIPTION_TOKEN") }
                 do { try LocalCredentialFailure.validateSubscriptionToken(subscriptionToken) }
@@ -178,9 +246,11 @@ final class ConversationViewModel: ObservableObject {
                     self.status = "正在启动 Claude Code…"
                     self.addActivity(record.id, "正在启动 Claude Code…", state: .running)
                     self.mutate(record.id) { $0.messages.append(.init(id: assistantID, role: .assistant, text: "", state: .running, runID: token, requestTraces: [])) }
+                    if let project { try self.validateBoundProjectDirectory(project.directory) }
                     let request = ChatRequest(request_id: token.uuidString, apiKey: key, model: model,
                                               messages: self.transcript(record.id, latestUser: userID),
-                                              provider: executionProvider, subscriptionToken: subscriptionToken, text_skills: textSkills)
+                                              provider: executionProvider, subscriptionToken: subscriptionToken, text_skills: textSkills,
+                                              project: project, conversationSessionID: record.id)
                     var completed = false
                     for try await event in self.provider.events(for: request) {
                         try Task.checkCancellation()
@@ -193,9 +263,13 @@ final class ConversationViewModel: ObservableObject {
                             self.update(record.id, assistantID) { $0.text += text; $0.state = .streaming }
                             self.scheduleSave()
                         case .completed(let text):
+                            guard self.activeToolActivities.isEmpty else { throw ChatFailure.code("CHAT_RESPONSE_INVALID") }
                             self.update(record.id, assistantID) { $0.text = text; $0.state = .complete }
                             self.addActivity(record.id, "回复完成")
                             completed = true
+                        case .toolActivity(let tool, let phase, let toolID):
+                            try self.acceptToolActivity(tool: tool, phase: phase, toolID: toolID, conversation: record.id)
+                            self.flushPersistence()
                         case .requestTrace(let trace):
                             try self.acceptTrace(trace, runID: token, conversation: record.id, assistant: assistantID,
                                                  knownSecrets: [key, subscriptionToken].compactMap { $0 })
@@ -222,6 +296,7 @@ final class ConversationViewModel: ObservableObject {
             $0.requestTraces = $0.requestTraces?.map { $0.markingInterrupted() }
         } }
         else if let messageID = activeUserID { update(id, messageID) { $0.state = .cancelled; $0.error = "已停止。" } }
+        finishToolActivities(in: id, state: .cancelled)
         finishActivity(id, "已停止", state: .cancelled)
         restoreDraft(id); flushPersistence()
     }
@@ -254,11 +329,74 @@ final class ConversationViewModel: ObservableObject {
 
     func flushPersistence() {
         saveTask?.cancel(); saveTask = nil
-        guard canPersist else { return }
+        pruneExpiredRequestBodies()
+        guard canPersist else {
+            if pendingBodyCleanup { diagnosticError = "诊断正文已从当前视图清理，但会话文件不可写，磁盘副本仍可能保留。请先解决会话文件错误。" }
+            return
+        }
         do {
             try store.save(.init(selectedID: selectedID, conversations: conversations))
             persistenceError = nil
-        } catch { persistenceError = (error as? ConversationStoreFailure)?.message ?? "会话保存失败，请检查磁盘空间和访问权限。" }
+            pendingBodyCleanup = false; diagnosticError = nil
+        } catch {
+            persistenceError = (error as? ConversationStoreFailure)?.message ?? "会话保存失败，请检查磁盘空间和访问权限。"
+            if pendingBodyCleanup { diagnosticError = "诊断正文已从当前视图清理，但磁盘保存失败，旧副本仍可能保留。请检查权限和磁盘空间后重试。" }
+        }
+        scheduleTraceExpiration()
+    }
+
+    func expireRequestBodies() {
+        pruneExpiredRequestBodies()
+        if pendingBodyCleanup { flushPersistence() }
+        else { scheduleTraceExpiration() }
+    }
+
+    func clearRequestBodies(conversationID: UUID? = nil, runID: UUID? = nil) {
+        for index in conversations.indices where conversationID == nil || conversations[index].id == conversationID {
+            for message in conversations[index].messages.indices {
+                guard runID == nil || conversations[index].messages[message].runID == runID,
+                      let traces = conversations[index].messages[message].requestTraces else { continue }
+                let cleared = traces.map { $0.removingBody() }
+                if cleared != traces {
+                    conversations[index].messages[message].requestTraces = cleared
+                    pendingBodyCleanup = true
+                }
+            }
+        }
+        if activeToken != nil, conversationID == nil || conversationID == activeConversationID,
+           runID == nil || runID == activeToken {
+            bodyClearedForActiveRun = true
+        }
+        if pendingBodyCleanup { flushPersistence() }
+    }
+
+    private func pruneExpiredRequestBodies() {
+        let now = diagnosticNow()
+        for index in conversations.indices {
+            for message in conversations[index].messages.indices {
+                guard let traces = conversations[index].messages[message].requestTraces else { continue }
+                let retained = traces.map { $0.removingExpiredBody(now: now) }
+                if retained != traces {
+                    conversations[index].messages[message].requestTraces = retained
+                    pendingBodyCleanup = true
+                }
+            }
+        }
+    }
+
+    private func scheduleTraceExpiration() {
+        traceExpiryTask?.cancel(); traceExpiryTask = nil
+        guard !isTerminationInProgress else { return }
+        let now = diagnosticNow()
+        let next = conversations.flatMap(\.messages).flatMap { $0.requestTraces ?? [] }
+            .filter(\.hasBody).compactMap(\.expiresAt).min()
+        let wait = pendingBodyCleanup ? 60.0 : next.map { max(0.01, $0.timeIntervalSince(now)) }
+        guard let wait else { return }
+        traceExpiryTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(min(wait, 86_400))) }
+            catch { return } // Rescheduling or closing the view model cancels this timer.
+            self?.expireRequestBodies()
+        }
     }
     func beginLoginReset() {
         isLoginResetInProgress = true
@@ -296,11 +434,12 @@ final class ConversationViewModel: ObservableObject {
     var isTerminationWorkSettled: Bool { runTask == nil && !isBusy && translationTasks.isEmpty }
     func beginTermination() {
         isTerminationInProgress = true
+        traceExpiryTask?.cancel(); traceExpiryTask = nil
         stop()
         for task in translationTasks.values { task.cancel() }
         saveTask?.cancel(); saveTask = nil
     }
-    func endTermination() { isTerminationInProgress = false }
+    func endTermination() { isTerminationInProgress = false; expireRequestBodies() }
 
     /// Only persist after cancelled tasks have released their captured state.
     /// Quit keeps the current selection, history, draft and all credentials.
@@ -309,11 +448,13 @@ final class ConversationViewModel: ObservableObject {
             throw ApplicationTerminationFailure.drainTimedOut(["聊天与消息翻译"])
         }
         guard canPersist else { throw ApplicationTerminationFailure.persistenceFailed }
+        pruneExpiredRequestBodies()
         let snapshot = ConversationSnapshot(selectedID: selectedID, conversations: conversations)
         do {
             try store.save(snapshot)
             guard try store.load() == snapshot else { throw ApplicationTerminationFailure.persistenceFailed }
             persistenceError = nil
+            pendingBodyCleanup = false; diagnosticError = nil
         } catch {
             persistenceError = "会话保存或回读验证失败，App 已保持打开。请检查磁盘空间和数据目录权限后重试退出。"
             throw ApplicationTerminationFailure.persistenceFailed
@@ -368,26 +509,39 @@ final class ConversationViewModel: ObservableObject {
     private func isActive(_ token: UUID, in id: UUID) -> Bool { activeToken == token && conversations.contains { $0.id == id } }
     private func acceptTrace(_ trace: ChatRequestTrace, runID: UUID, conversation: UUID, assistant: UUID, knownSecrets: [String]) throws {
         try trace.validate(runID: runID, knownSecrets: knownSecrets)
-        guard let record = conversations.first(where: { $0.id == conversation }),
+        guard trace.schema == "claude-request-trace/v1",
+              let record = conversations.first(where: { $0.id == conversation }),
               let message = record.messages.first(where: { $0.id == assistant && $0.runID == runID }) else {
             throw ChatFailure.code("CHAT_RESPONSE_INVALID")
         }
         var traces = message.requestTraces ?? []
         if let index = traces.firstIndex(where: { $0.attemptID == trace.attemptID }) {
-            guard traces[index].phase == .request, trace.phase != .request, traces[index].hasSameRequest(as: trace) else {
+            guard traces[index].phase == .request, trace.phase != .request,
+                  let original = activeTraceRequests[trace.attemptID], original.trace.hasSameRequest(as: trace) else {
                 throw ChatFailure.code("CHAT_RESPONSE_INVALID")
             }
-            traces[index] = trace
+            var retained = trace.persisted(captureBody: captureBodiesForActiveRun, capturedAt: original.capturedAt)
+                .removingExpiredBody(now: diagnosticNow())
+            if bodyClearedForActiveRun { retained = retained.removingBody() }
+            traces[index] = retained
+            activeTraceRequests.removeValue(forKey: trace.attemptID)
         } else {
-            guard trace.phase == .request, traces.count < 3, trace.attempt == traces.count + 1,
+            guard trace.phase == .request, traces.count < (activeProjectDirectory == nil ? 3 : ChatProject.maximumRequests), trace.attempt == traces.count + 1,
                   traces.allSatisfy({ $0.phase != .request }) else { throw ChatFailure.code("CHAT_RESPONSE_INVALID") }
-            traces.append(trace)
+            let capturedAt = diagnosticNow()
+            activeTraceRequests[trace.attemptID] = (trace, capturedAt)
+            var retained = trace.persisted(captureBody: captureBodiesForActiveRun, capturedAt: capturedAt)
+            if bodyClearedForActiveRun { retained = retained.removingBody() }
+            traces.append(retained)
         }
         update(conversation, assistant) { $0.requestTraces = traces }
     }
     private func finish(_ token: UUID) {
         guard activeToken == token else { return }
+        if let id = activeConversationID { projectDirectoryErrors.removeValue(forKey: id) }
         activeToken = nil; activeConversationID = nil; activeUserID = nil; activeAssistantID = nil
+        activeTraceRequests.removeAll(); captureBodiesForActiveRun = false; bodyClearedForActiveRun = false
+        activeProjectDirectory = nil; activeToolActivities.removeAll()
         status = nil; runTask = nil; activeOriginal = ""; flushPersistence()
     }
     private func failRun(_ token: UUID, conversation: UUID, user: UUID, error: Error) {
@@ -398,6 +552,7 @@ final class ConversationViewModel: ObservableObject {
             $0.state = cancelled ? .cancelled : .failed; $0.error = text
             if cancelled { $0.requestTraces = $0.requestTraces?.map { $0.markingInterrupted() } }
         }
+        finishToolActivities(in: conversation, state: cancelled ? .cancelled : .failed)
         finishActivity(conversation, cancelled ? "已停止" : "执行失败", state: cancelled ? .cancelled : .failed)
         restoreDraft(conversation)
     }
@@ -408,8 +563,52 @@ final class ConversationViewModel: ObservableObject {
         if let error = error as? ExecutionConfigurationError { return error.message }
         if let error = error as? TranslationConfigurationError { return error.message }
         if let error = error as? TextSkillFailure { return error.message }
+        if let error = error as? ProjectDirectoryFailure { return error.message }
+        if let error = error as? BoundProjectDirectoryFailure { return error.message }
         return "执行失败，请检查设置和网络后重试。"
     }
+    private func validateBoundProjectDirectory(_ directory: String) throws {
+        guard try ProjectDirectory.normalized(directory) == directory else {
+            throw BoundProjectDirectoryFailure.locationChanged
+        }
+    }
+
+    private func acceptToolActivity(tool: String, phase: String, toolID: String, conversation: UUID) throws {
+        let labels = ["Read": "读取文件", "Write": "写入文件", "Edit": "编辑文件", "Bash": "运行项目命令", "Glob": "查找文件", "Grep": "搜索内容"]
+        guard activeProjectDirectory != nil, let label = labels[tool], !toolID.isEmpty else {
+            throw ChatFailure.code("CHAT_RESPONSE_INVALID")
+        }
+        switch phase {
+        case "started":
+            guard activeToolActivities[toolID] == nil else { throw ChatFailure.code("CHAT_RESPONSE_INVALID") }
+            let messageID = UUID()
+            activeToolActivities[toolID] = (tool, messageID)
+            mutate(conversation) { $0.messages.append(.init(id: messageID, role: .activity, text: "\(label)（\(tool)）：开始", state: .running)) }
+            status = "正在\(label)…"
+        case "completed", "failed":
+            guard let activity = activeToolActivities[toolID], activity.tool == tool else {
+                throw ChatFailure.code("CHAT_RESPONSE_INVALID")
+            }
+            activeToolActivities.removeValue(forKey: toolID)
+            update(conversation, activity.messageID) {
+                $0.text = "\(label)（\(tool)）：\(phase == "failed" ? "失败" : "完成")"
+                $0.state = phase == "failed" ? .failed : .complete
+            }
+            if activeToolActivities.isEmpty { status = "模型正在回复…" }
+        default: throw ChatFailure.code("CHAT_RESPONSE_INVALID")
+        }
+    }
+
+    private func finishToolActivities(in conversation: UUID, state: ConversationMessageState) {
+        for activity in activeToolActivities.values {
+            update(conversation, activity.messageID) {
+                $0.text = "\(activity.tool)：\(state == .cancelled ? "已停止" : "执行失败")"
+                $0.state = state
+            }
+        }
+        activeToolActivities.removeAll()
+    }
+
     private func mutate(_ id: UUID, _ action: (inout ConversationRecord) -> Void) {
         guard let index = conversations.firstIndex(where: { $0.id == id }) else { return }
         action(&conversations[index]); conversations[index].updatedAt = Date()
@@ -445,4 +644,9 @@ final class MemoryConversationStore: ConversationPersisting {
     init(_ snapshot: ConversationSnapshot = .empty) { self.snapshot = snapshot }
     func load() throws -> ConversationSnapshot { snapshot }
     func save(_ snapshot: ConversationSnapshot) throws { try snapshot.validate(); self.snapshot = snapshot }
+}
+
+private enum BoundProjectDirectoryFailure: Error {
+    case locationChanged
+    var message: String { "执行目录的位置已变化。请重新选择目录，确认允许访问的位置后重试。" }
 }

@@ -25,6 +25,9 @@ if (!/^\d+\.\d+\.\d+$/.test(runtimeVersions.sdk_version ?? '') ||
 const { runVMTextChat, productionLauncher } = await import(moduleURL('vm-text-chat.mjs'));
 const { officialTransport } = await import(moduleURL('deepseek-text-chat.mjs'));
 const receipts = [], deviceIDs = [], sessionIDs = [];
+const DEVICE_ID = '6'.repeat(64);
+const CONVERSATION_ID = '4fb858fc-93c9-42ee-8939-ce25b127394d';
+const OTHER_CONVERSATION_ID = '9d8eb58e-de62-4306-ad15-f2fb64879021';
 const ACK = 'VM_NATIVE_PRIVATE_OK';
 const deepseek = { ...SUBSCRIPTION_INPUT, provider: 'deepseek-api', model: 'deepseek-flash[1m]',
   apiKey: 'sk-HOST-ONLY-INERT-VM-PRIVACY-FIXTURE' };
@@ -61,7 +64,8 @@ async function run(input, mode = 'success') {
     if (input.provider === 'claude-subscription') {
       identity = JSON.parse(parameters.body.metadata.user_id);
       beta = parameters.headers['anthropic-beta'].split(',');
-      assert.equal(identity.account_uuid, '');
+      assert.deepEqual(identity, { ...input.identity, account_uuid: '' });
+      assert.equal(parameters.headers['x-claude-code-session-id'], input.identity.session_id);
     } else assert.equal('metadata' in parameters.body, false);
     return subscriptionSSE(ACK, parameters.body.model);
   } };
@@ -89,18 +93,22 @@ async function run(input, mode = 'success') {
 
 try {
   await run(deepseek);
-  for (const model of ['sonnet', 'sonnet', 'opus', 'haiku']) await run({ ...SUBSCRIPTION_INPUT, model });
+  for (const [model, session_id] of [['sonnet', CONVERSATION_ID], ['sonnet', CONVERSATION_ID],
+    ['opus', CONVERSATION_ID], ['haiku', OTHER_CONVERSATION_ID]]) {
+    await run({ ...SUBSCRIPTION_INPUT, model, identity: { device_id: DEVICE_ID, session_id } });
+  }
   const reserved = createServer(); reserved.listen(0, '127.0.0.1'); await once(reserved, 'listening');
   const port = reserved.address().port; await new Promise(resolve => reserved.close(resolve));
   await run({ ...deepseek, network: { ...deepseek.network, proxyURL: `http://127.0.0.1:${port}` } }, 'proxy-failure');
   await run(deepseek, 'cancel-active');
-  assert.equal(new Set(deviceIDs).size, deviceIDs.length);
-  assert.equal(new Set(sessionIDs).size, sessionIDs.length);
+  assert.deepEqual(deviceIDs, Array(4).fill(DEVICE_ID));
+  assert.deepEqual(sessionIDs, [CONVERSATION_ID, CONVERSATION_ID, CONVERSATION_ID, OTHER_CONVERSATION_ID]);
   assert.equal(blockedHostSDKImports, 0);
   console.log(JSON.stringify({ schema: 'vm-native-privacy-gate/v1', status: 'passed_local_native_vm',
     artifact: bundled ? 'bundled_runtime' : 'source_runtime',
     runs: receipts.length, sdk_version: runtimeVersions.sdk_version, cli_version: cliVersion,
     host_sdk_import_forbidden_by_test_hook: true, host_sdk_import_attempts: blockedHostSDKImports,
-    fresh_config_device_ids_differ: true, fresh_sessions_differ: true,
+    installation_device_id_preserved_across_fresh_vms: true,
+    conversation_session_id_preserved_across_turns_and_models: true, different_conversation_has_different_session_id: true,
     real_credentials_read: false, real_provider_calls: false, real_subscription_verified: false, receipts }, null, 2));
 } finally { hooks.deregister(); }

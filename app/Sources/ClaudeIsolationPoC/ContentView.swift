@@ -4,6 +4,7 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject var chat: ConversationViewModel
     @ObservedObject var browser: BrowserVMController
+    @ObservedObject var execution: ExecutionViewModel
     let configuration: AppConfiguration?
     @Environment(\.openSettings) private var openSettings
     @State private var composerFocusRequest = 0
@@ -14,6 +15,9 @@ struct ContentView: View {
     @State private var smokeTestScheduled = false
     @State private var isNearBottom = true
     @State private var showingBrowser = false
+    @State private var directoryPickerConversationID: UUID?
+    @State private var directoryPicker: NSOpenPanel?
+    @State private var directoryPickerError: String?
     private var isOfflineDemo: Bool { CommandLine.arguments.contains("--ui-fixture") }
 
     var body: some View {
@@ -31,6 +35,18 @@ struct ContentView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 28).padding(.vertical, 10)
                             .accessibilityIdentifier("conversation-persistence-error")
+                    }
+                    if let error = chat.diagnosticError {
+                        WorkbenchErrorLine(text: error)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 28).padding(.vertical, 10)
+                            .accessibilityIdentifier("conversation-diagnostic-error")
+                    }
+                    if let error = directoryPickerError ?? chat.projectDirectoryError {
+                        WorkbenchErrorLine(text: error)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 28).padding(.vertical, 10)
+                            .accessibilityIdentifier("conversation-project-error")
                     }
                     conversation
                     ComposerView(chat: chat, configuration: configuration, focusRequest: composerFocusRequest)
@@ -60,6 +76,7 @@ struct ContentView: View {
             Text("此会话的本地对话记录会被删除。")
         }
         .onAppear { scheduleSmokeTest() }
+        .onDisappear { dismissProjectDirectoryPicker() }
     }
 
     private var sidebar: some View {
@@ -172,6 +189,13 @@ struct ContentView: View {
             Text(chat.selectedConversation?.title ?? "新会话")
                 .font(.system(size: 14, weight: .medium)).lineLimit(1)
                 .accessibilityIdentifier("current-conversation-title")
+            projectDirectoryMenu
+            if execution.provider == .claudeSubscription, let accounts = execution.subscriptionAccounts {
+                SubscriptionAccountMenu(model: accounts, canManage: accounts.canMutate(), openSettings: { openSettings() }) { id, startNew in
+                    guard accounts.select(id: id) else { return }
+                    if startNew { newConversation() }
+                }
+            }
             Spacer(minLength: 12)
             if chat.isCurrentConversationBusy {
                 ProgressView().controlSize(.small)
@@ -180,6 +204,96 @@ struct ContentView: View {
             }
         }
         .padding(.horizontal, 26).frame(height: 54)
+    }
+
+    private var projectDirectoryMenu: some View {
+        Menu {
+            Button(chat.selectedConversation?.projectDirectory == nil ? "选择执行目录…" : "更换执行目录…", action: chooseProjectDirectory)
+            if let id = chat.selectedID, chat.selectedConversation?.projectDirectory != nil {
+                Button("取消目录关联") { chat.setProjectDirectory(nil, for: id) }
+            }
+        } label: {
+            Label(chat.selectedConversation?.projectDirectory.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "选择执行目录", systemImage: "folder")
+                .font(.system(size: 12))
+                .lineLimit(1).truncationMode(.middle)
+                .frame(maxWidth: 220)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize(horizontal: false, vertical: true)
+        .disabled(!chat.canChangeProjectDirectory || directoryPickerConversationID != nil)
+        .help(chat.selectedConversation?.projectDirectory ?? "选择项目文件夹以读写文件并在隔离 VM 中执行命令；未选择时为纯文本聊天。")
+        .accessibilityIdentifier("conversation-project-directory")
+        .accessibilityLabel(chat.selectedConversation?.projectDirectory.map { "执行目录：\($0)" } ?? "选择执行目录，当前为纯文本聊天")
+    }
+
+    private func chooseProjectDirectory() {
+        guard let conversationID = chat.selectedID, chat.canChangeProjectDirectory(in: conversationID),
+              directoryPickerConversationID == nil else { return }
+        let panel = NSOpenPanel()
+        panel.title = "选择会话执行目录"
+        panel.message = "Claude 可直接读写所选项目文件夹；项目命令将在隔离 VM 内运行。"
+        panel.prompt = "使用此目录"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.treatsFilePackagesAsDirectories = false
+        if let directory = chat.selectedConversation?.projectDirectory {
+            panel.directoryURL = URL(fileURLWithPath: directory, isDirectory: true)
+        }
+        let presentingWindow = NSApp.keyWindow ?? NSApp.mainWindow
+        directoryPickerConversationID = conversationID
+        directoryPicker = panel
+        directoryPickerError = nil
+        // Let the SwiftUI Menu finish tracking before presenting its window's sheet.
+        DispatchQueue.main.async {
+            guard directoryPicker === panel, directoryPickerConversationID == conversationID else { return }
+            guard chat.canChangeProjectDirectory(in: conversationID) else {
+                dismissProjectDirectoryPicker()
+                directoryPickerError = "会话状态已变化。请在会话空闲时重新选择执行目录。"
+                return
+            }
+            if let presentingWindow, presentingWindow.isVisible {
+                guard presentingWindow.attachedSheet == nil else {
+                    dismissProjectDirectoryPicker()
+                    directoryPickerError = "请先关闭当前弹窗，再选择执行目录。"
+                    return
+                }
+                panel.beginSheetModal(for: presentingWindow) { response in
+                    finishProjectDirectorySelection(panel, response: response, conversationID: conversationID)
+                }
+            } else {
+                finishProjectDirectorySelection(panel, response: panel.runModal(), conversationID: conversationID)
+            }
+        }
+    }
+
+    private func finishProjectDirectorySelection(_ panel: NSOpenPanel, response: NSApplication.ModalResponse,
+                                                 conversationID: UUID) {
+        guard directoryPicker === panel, directoryPickerConversationID == conversationID else { return }
+        panel.orderOut(nil)
+        directoryPicker = nil
+        directoryPickerConversationID = nil
+        switch response {
+        case .OK:
+            guard let url = panel.url else {
+                directoryPickerError = "目录选择器未返回文件夹。请重新选择执行目录。"
+                return
+            }
+            chat.setProjectDirectory(url.path, for: conversationID)
+        case .cancel:
+            break
+        default:
+            directoryPickerError = "无法打开目录选择器。请重新选择执行目录；已有目录关联未更改。"
+        }
+    }
+
+    private func dismissProjectDirectoryPicker() {
+        let panel = directoryPicker
+        directoryPicker = nil
+        directoryPickerConversationID = nil
+        panel?.cancel(nil)
+        panel?.orderOut(nil)
     }
 
     private var conversation: some View {
@@ -257,6 +371,11 @@ struct ContentView: View {
             Text("用中文描述任务。发送后，译文和模型的执行过程会显示在这里。")
                 .font(.system(size: 14)).foregroundStyle(WorkbenchTheme.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
+            Text(chat.selectedConversation?.projectDirectory == nil
+                 ? "选择执行目录后，Claude 可以读写项目文件并在隔离 VM 中运行命令。未选择时为纯文本聊天。"
+                 : "Claude 可以读写此会话的项目文件，并在隔离 VM 中运行项目命令。")
+                .font(.system(size: 12)).foregroundStyle(WorkbenchTheme.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
             if chat.selectedID == nil {
                 Button("新建会话", action: newConversation).buttonStyle(.bordered)
                     .padding(.top, 4)
@@ -287,7 +406,10 @@ struct ContentView: View {
         if let record = chat.selectedConversation,
            let message = record.messages.first(where: { $0.id == requestDetailsMessageID }) {
             RequestDetailsView(message: chat.requestDetailsMessage(for: message, in: record),
-                               traces: chat.requestTraces(for: message, in: record))
+                               traces: chat.requestTraces(for: message, in: record),
+                               onClearBody: { chat.clearRequestBodies(conversationID: record.id, runID: message.runID) },
+                               diagnosticError: chat.diagnosticError)
+                .onAppear { chat.expireRequestBodies() }
         }
     }
 

@@ -7,6 +7,18 @@ struct ChatTranscriptMessage: Codable, Equatable, Sendable {
     let text: String
 }
 
+struct ChatProject: Encodable, Equatable, Sendable {
+    static let tools: Set<String> = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+    static let maximumRequests = 24
+    static let maximumToolCalls = 64
+    let directory: String
+
+    func validate() throws {
+        do { try ProjectDirectory.validateStoredPath(directory) }
+        catch { throw ChatFailure.code("INVALID_PROJECT_DIRECTORY") }
+    }
+}
+
 struct ChatRequest: Encodable, Sendable {
     let schema = "deepseek-text-chat/v1"
     let request_id: String
@@ -18,12 +30,21 @@ struct ChatRequest: Encodable, Sendable {
     var text_skills: [TextSkillContext] = []
     var network: AppNetworkPolicy? = nil
     var runtime: AppRuntimeProfile? = nil
+    var identity: ClaudeRequestIdentity? = nil
+    var project: ChatProject? = nil
+    // App-owned conversation UUID; only the broker identity envelope is encoded.
+    var conversationSessionID: UUID? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case schema, request_id, apiKey, model, messages, provider, subscriptionToken, text_skills, network, runtime, identity, project
+    }
 
     func validate() throws {
         guard UUID(uuidString: request_id) != nil else { throw ChatFailure.code("INVALID_REQUEST_ID") }
+        try project?.validate()
         switch provider {
         case .deepseekAPI:
-            guard subscriptionToken == nil else { throw ChatFailure.code("CREDENTIAL_MODE_MISMATCH") }
+            guard subscriptionToken == nil, identity == nil else { throw ChatFailure.code("CREDENTIAL_MODE_MISMATCH") }
             guard ["deepseek-flash[1m]", "deepseek-flash"].contains(model) else { throw ChatFailure.code("MODEL_NOT_ALLOWED") }
             guard let apiKey, (16...512).contains(apiKey.utf8.count),
                   !apiKey.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) })
@@ -34,6 +55,10 @@ struct ChatRequest: Encodable, Sendable {
             guard let subscriptionToken else { throw ChatFailure.code("MISSING_SUBSCRIPTION_TOKEN") }
             do { try LocalCredentialFailure.validateSubscriptionToken(subscriptionToken) }
             catch { throw ChatFailure.code("INVALID_SUBSCRIPTION_TOKEN") }
+            if let identity {
+                do { try identity.validate() }
+                catch { throw ChatFailure.code("INSTALLATION_IDENTITY_UNAVAILABLE") }
+            }
         }
         guard !messages.isEmpty, messages.count <= 101, messages.count % 2 == 1 else { throw ChatFailure.code("INVALID_HISTORY") }
         var bytes = 0
@@ -66,6 +91,7 @@ enum ChatEvent: Equatable, Sendable {
     case delta(String)
     case completed(String)
     case requestTrace(ChatRequestTrace)
+    case toolActivity(tool: String, phase: String, toolID: String)
 }
 
 enum ChatFailure: Error, Sendable {
@@ -81,6 +107,25 @@ enum ChatFailure: Error, Sendable {
             return "请在 Claude 订阅设置中填写并保存 claude setup-token 生成的有效 Token。"
         case .code("CREDENTIAL_MODE_MISMATCH"):
             return "执行来源与凭据不匹配，请检查 Claude Code 设置后重试。"
+        case .code("INSTALLATION_IDENTITY_UNAVAILABLE"):
+            return "无法读取或保存本机设备身份，本次模型请求未发送。请检查 App 数据目录权限；已有身份文件不会自动重建。"
+        case .code("VM_IDENTITY_UNSUPPORTED"):
+            return "当前运行包不支持稳定设备与会话身份。请在更新设置中选择新版运行包或此版本 App 的内置运行包。"
+        case .code("VM_PROJECT_UNSUPPORTED"), .code("PROJECT_EXECUTION_UNSUPPORTED"), .code("VM_PROJECT_REQUIRED"):
+            return "当前运行环境不支持项目目录执行。请更新支持项目执行的运行包后重试；本次未切换为纯文本请求。"
+        case .code("INVALID_PROJECT_DIRECTORY"), .code("PROJECT_DIRECTORY_UNAVAILABLE"), .code("PROJECT_DIRECTORY_CHANGED"):
+            return "执行目录不存在、权限不足或已发生变化。请重新选择可读写的项目文件夹。"
+        case .code("PROJECT_DIRECTORY_PROTECTED"), .code("PROJECT_DIRECTORY_FORBIDDEN"):
+            return "请选取具体的项目文件夹；整个用户主目录及 App 私有数据目录不能作为执行目录。"
+        case .code("PROJECT_MOUNT_REJECTED"), .code("PROJECT_MOUNT_UNAVAILABLE"):
+            return "隔离环境未能挂载所选执行目录，本次项目执行已停止。请检查目录权限和运行包。"
+        case .code("PROJECT_TOOL_REJECTED"), .code("PROJECT_TOOL_CONTRACT"), .code("PROJECT_PATH_REJECTED"):
+            return "项目工具请求超出所选目录或允许的工具范围，本次执行已停止。"
+        case .code("PROJECT_CONTRACT_REJECTED"), .code("PROJECT_PROTOCOL_REJECTED"),
+             .code("PROJECT_TOOL_PROTOCOL_REJECTED"), .code("PROJECT_TOOL_RESULT_REJECTED"), .code("PROJECT_TRANSCRIPT_REJECTED"):
+            return "项目工具调用或执行结果未通过校验，本次执行已停止。请检查运行包或重试。"
+        case .code("INVALID_IDENTITY"), .code("NATIVE_IDENTITY_MISMATCH"), .code("GUEST_IDENTITY_CONFIG_FAILED"):
+            return "Claude 设备或会话身份未通过校验，本次请求已停止。请更新运行包后重试。"
         case .code("SUBSCRIPTION_PROTOCOL_REJECTED"):
             return "官方 CLI 的订阅协议未通过校验，请更新 App 后重试。"
         case .code("SUBSCRIPTION_HTTP_401"), .code("SUBSCRIPTION_HTTP_403"):
@@ -89,6 +134,8 @@ enum ChatFailure: Error, Sendable {
             return "Claude 订阅额度或请求频率受限，请稍后重试；本次不会切换到 API 计费。"
         case .code("CREDENTIAL_STORE_UNAVAILABLE"):
             return "无法读取本机保存的凭据，请检查 App 凭据目录权限或文件格式后重试。"
+        case .code("SUBSCRIPTION_ACCOUNT_REQUIRED"):
+            return "请在设置中添加并选择一个 Claude 订阅账号，再重新发送。"
         case .code("CHAT_BRIDGE_MISSING"), .code("NODE_NOT_AVAILABLE"):
             return "文本会话运行文件不可用，请检查 App 的安装路径。"
         case .code("INVALID_HISTORY"), .code("HISTORY_LIMIT"), .code("INPUT_LIMIT"):
@@ -290,17 +337,22 @@ struct ChatEventParser {
     private let model: String
     private let fixtureOnly: Bool
     private let provider: ExecutionProvider
+    private let projectExecution: Bool
     private let knownSecrets: [String]
     private var started = false
     private var terminalText: String?
     private var cumulativeText = ""
     private var requestTraces: [ChatRequestTrace] = []
+    private var toolCalls: [String: (tool: String, phase: String)] = [:]
+    private var maximumRequests: Int { projectExecution ? ChatProject.maximumRequests : 3 }
 
-    init(requestID: String, model: String, fixtureOnly: Bool, provider: ExecutionProvider = .deepseekAPI, knownSecrets: [String] = []) {
+    init(requestID: String, model: String, fixtureOnly: Bool, provider: ExecutionProvider = .deepseekAPI,
+         projectExecution: Bool = false, knownSecrets: [String] = []) {
         self.requestID = requestID
         self.model = model
         self.fixtureOnly = fixtureOnly
         self.provider = provider
+        self.projectExecution = projectExecution
         self.knownSecrets = knownSecrets
     }
 
@@ -316,7 +368,7 @@ struct ChatEventParser {
         let common: Set<String> = ["schema", "request_id", "model", "type", "fixture_only"]
         switch type {
         case "started":
-            guard Set(value.keys) == common.union(["no_tools"]), !started, boolean(value["no_tools"]) == true
+            guard Set(value.keys) == common.union(["no_tools"]), !started, boolean(value["no_tools"]) == !projectExecution
             else { throw ChatFailure.code("CHAT_RESPONSE_INVALID") }
             started = true
             return .started
@@ -327,21 +379,40 @@ struct ChatEventParser {
             guard cumulativeText.utf8.count + text.utf8.count <= 524_288 else { throw ChatFailure.code("CHAT_OUTPUT_TOO_LARGE") }
             cumulativeText += text
             return .delta(text)
+        case "tool_activity":
+            guard projectExecution, started,
+                  Set(value.keys) == common.union(["tool_id", "tool", "phase"]),
+                  let toolID = value["tool_id"] as? String, !toolID.isEmpty, toolID.utf8.count <= 128,
+                  toolID.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 95 }),
+                  let tool = value["tool"] as? String, ChatProject.tools.contains(tool),
+                  let phase = value["phase"] as? String, ["started", "completed", "failed"].contains(phase)
+            else { throw ChatFailure.code("CHAT_RESPONSE_INVALID") }
+            if phase == "started" {
+                guard toolCalls[toolID] == nil, toolCalls.count < ChatProject.maximumToolCalls
+                else { throw ChatFailure.code("CHAT_RESPONSE_INVALID") }
+            } else {
+                guard let previous = toolCalls[toolID], previous.tool == tool, previous.phase == "started"
+                else { throw ChatFailure.code("CHAT_RESPONSE_INVALID") }
+            }
+            toolCalls[toolID] = (tool, phase)
+            return .toolActivity(tool: tool, phase: phase, toolID: toolID)
         case "request_trace":
             guard Set(value.keys) == common.union(["trace"]), let traceValue = value["trace"] as? [String: Any],
                   let runID = UUID(uuidString: requestID),
                   let traceData = try? JSONSerialization.data(withJSONObject: traceValue),
                   let trace = try? JSONDecoder().decode(ChatRequestTrace.self, from: traceData),
+                  trace.schema == "claude-request-trace/v1",
                   trace.provider == provider, trace.attemptID == "\(requestID):\(trace.attempt)"
             else { throw ChatFailure.code("CHAT_RESPONSE_INVALID") }
             try trace.validate(runID: runID, knownSecrets: knownSecrets)
+            guard trace.attempt <= maximumRequests else { throw ChatFailure.code("CHAT_RESPONSE_INVALID") }
             if let index = requestTraces.firstIndex(where: { $0.attemptID == trace.attemptID }) {
                 guard requestTraces[index].phase == .request, trace.phase != .request,
                       requestTraces[index].hasSameRequest(as: trace)
                 else { throw ChatFailure.code("CHAT_RESPONSE_INVALID") }
                 requestTraces[index] = trace
             } else {
-                guard trace.phase == .request, requestTraces.count < 3,
+                guard trace.phase == .request, requestTraces.count < maximumRequests,
                       trace.attempt == requestTraces.count + 1,
                       requestTraces.allSatisfy({ $0.phase != .request })
                 else { throw ChatFailure.code("CHAT_RESPONSE_INVALID") }
@@ -353,17 +424,20 @@ struct ChatEventParser {
                   started, let text = value["text"] as? String,
                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   text == cumulativeText,
-                  boolean(value["no_tools"]) == true, integer(value["cli_exit"]) == 0,
+                  boolean(value["no_tools"]) == !projectExecution, integer(value["cli_exit"]) == 0,
                   value["cli_signal"] is NSNull,
                   boolean(value["temporary_removed"]) == true, boolean(value["proxy_closed"]) == true,
-                  let requests = integer(value["request_count"]), (1...3).contains(requests),
+                  let requests = integer(value["request_count"]), (1...maximumRequests).contains(requests),
+                  toolCalls.values.allSatisfy({ $0.phase != "started" }),
                   requestTraces.isEmpty || (requestTraces.count == requests && requestTraces.allSatisfy({ $0.phase != .request }))
             else { throw ChatFailure.code("CHAT_RESPONSE_INVALID") }
             terminalText = text
             return nil
         case "error":
             guard Set(value.keys) == common.union(["code"]), let code = value["code"] as? String,
-                  safeErrorCodes.contains(code) || appNetworkFailureMessage(code) != nil || appRuntimeFailureMessage(code) != nil || appVMFailureCodes.contains(code) || isHTTPError(code)
+                  safeErrorCodes.contains(code) || ["INVALID_IDENTITY", "VM_IDENTITY_UNSUPPORTED", "NATIVE_IDENTITY_MISMATCH", "GUEST_IDENTITY_CONFIG_FAILED"].contains(code)
+                    || projectErrorCodes.contains(code)
+                    || appNetworkFailureMessage(code) != nil || appRuntimeFailureMessage(code) != nil || appVMFailureCodes.contains(code) || isHTTPError(code)
             else { throw ChatFailure.code("CHAT_RESPONSE_INVALID") }
             throw ChatFailure.code(code)
         default:
@@ -399,6 +473,15 @@ struct ChatEventParser {
     private var safeErrorCodes: Set<String> {
         ["INVALID_INPUT", "INVALID_REQUEST_ID", "INVALID_API_KEY", "INVALID_SUBSCRIPTION_TOKEN", "MISSING_SUBSCRIPTION_TOKEN", "CREDENTIAL_MODE_MISMATCH", "PROVIDER_NOT_ALLOWED", "SUBSCRIPTION_PROTOCOL_REJECTED", "SUBSCRIPTION_HTTP_401", "SUBSCRIPTION_HTTP_403", "SUBSCRIPTION_HTTP_429", "MODEL_NOT_ALLOWED", "INVALID_HISTORY", "HISTORY_LIMIT", "INVALID_TEXT_SKILLS", "INVALID_ARGUMENTS", "INVALID_INPUT_JSON", "INPUT_LIMIT", "INPUT_TIMEOUT", "MISSING_EVENT_SINK", "INVALID_TEST_DEPENDENCIES", "CLI_REQUEST_REJECTED", "SANDBOX_PROFILE_REJECTED", "CLI_ARGUMENT_REJECTED", "CLI_MANAGED_POLICY_REJECTED", "CLI_PERMISSION_DENIED", "CLI_PATH_UNAVAILABLE", "CLI_MODEL_REJECTED", "PROVIDER_TIMEOUT", "SDK_IMPORT_FAILED", "PROVIDER_PROTOCOL_REJECTED", "PROVIDER_STREAM_ERROR", "PROVIDER_TOOL_RESPONSE", "PROVIDER_RESPONSE_LIMIT", "PROVIDER_OUTPUT_LIMIT", "PROVIDER_STREAM_INCOMPLETE", "CHAT_CANCELLED", "INPUT_VALIDATION_FAILED", "RUNTIME_INITIALIZATION_FAILED", "TEMPORARY_SETUP_FAILED", "LOCAL_PROXY_START_FAILED", "SANDBOX_PROFILE_SETUP_FAILED", "SDK_QUERY_START_FAILED", "SDK_ITERATION_FAILED", "QUERY_CLEANUP_FAILED", "CLI_CLEANUP_FAILED", "PROCESS_INTERRUPTED", "TOTAL_TIMEOUT", "LOCAL_AUTH_REJECTED", "LOCAL_ROUTE_REJECTED", "REQUEST_LIMIT", "REQUEST_BODY_LIMIT", "INVALID_REQUEST_JSON", "NO_TOOLS_CONTRACT", "DUPLICATE_NATIVE_INIT", "PROVIDER_REDIRECT_REJECTED", "PROVIDER_INVALID_HTTP_STATUS", "PROVIDER_CONNECTION_FAILED", "CLI_LAUNCH_CONTRACT", "CLI_PROCESS_ERROR", "CLI_NOT_STARTED", "CLI_TEXT_MISMATCH", "CLI_EXIT_FAILED", "CLI_CHANGED", "CLI_READBACK_FAILED", "TEMPORARY_CLEANUP_FAILED", "CHAT_FAILED", "NATIVE_PLATFORM_UNSUPPORTED", "NATIVE_PACKAGE_MISSING", "NATIVE_PATH_UNAVAILABLE", "NATIVE_DIGEST_MISMATCH", "SDK_VERSION_MISMATCH"]
     }
+
+    private var projectErrorCodes: Set<String> {
+        ["VM_PROJECT_UNSUPPORTED", "PROJECT_EXECUTION_UNSUPPORTED", "VM_PROJECT_REQUIRED", "INVALID_PROJECT_DIRECTORY",
+         "PROJECT_DIRECTORY_UNAVAILABLE", "PROJECT_DIRECTORY_CHANGED", "PROJECT_DIRECTORY_PROTECTED",
+         "PROJECT_DIRECTORY_FORBIDDEN", "PROJECT_CONTRACT_REJECTED", "PROJECT_PROTOCOL_REJECTED",
+         "PROJECT_TOOL_PROTOCOL_REJECTED", "PROJECT_TOOL_RESULT_REJECTED", "PROJECT_TRANSCRIPT_REJECTED",
+         "PROJECT_MOUNT_REJECTED", "PROJECT_MOUNT_UNAVAILABLE", "PROJECT_TOOL_REJECTED",
+         "PROJECT_TOOL_CONTRACT", "PROJECT_PATH_REJECTED"]
+    }
 }
 
 struct StdioChatProvider: ChatProviding {
@@ -406,6 +489,7 @@ struct StdioChatProvider: ChatProviding {
     var fixtureOnly = false
     var networkPolicyProvider: any NetworkPolicyProviding = SavedNetworkPolicyProvider()
     var runtimeProfileProvider: any RuntimeProfileProviding = SavedRuntimeProfileProvider()
+    var installationIdentityStore: any InstallationIdentityProviding = FileInstallationIdentityStore()
 
     func events(for request: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -431,6 +515,14 @@ struct StdioChatProvider: ChatProviding {
 
     private func execute(_ request: ChatRequest, controller: OwnedProcessController, emit: (ChatEvent) -> Void) throws {
         try request.validate()
+        if let project = request.project {
+            do {
+                guard try ProjectDirectory.normalized(project.directory) == project.directory else {
+                    throw ChatFailure.code("PROJECT_DIRECTORY_CHANGED")
+                }
+            } catch let failure as ChatFailure { throw failure }
+            catch { throw ChatFailure.code("PROJECT_DIRECTORY_UNAVAILABLE") }
+        }
         let configuration = self.configuration
         let runtimeConfiguration: AppConfiguration
         do { runtimeConfiguration = fixtureOnly ? configuration : try configuration.resolvingClaudeRuntime() }
@@ -444,6 +536,14 @@ struct StdioChatProvider: ChatProviding {
         catch let failure as RuntimeProfileFailure { throw ChatFailure.code(failure.code) }
         catch { throw ChatFailure.code("RUNTIME_PROFILE_INVALID") }
         securedRequest.runtime = runtime
+        if request.provider == .claudeSubscription && !fixtureOnly {
+            do {
+                let deviceID = try installationIdentityStore.loadOrCreateDeviceID()
+                securedRequest.identity = ClaudeRequestIdentity(device_id: deviceID,
+                    session_id: (request.conversationSessionID ?? UUID(uuidString: request.request_id)!).uuidString.lowercased())
+                try securedRequest.validate()
+            } catch { throw ChatFailure.code("INSTALLATION_IDENTITY_UNAVAILABLE") }
+        }
         let payload = try JSONEncoder().encode(securedRequest)
         guard payload.count <= 1_048_576 else { throw ChatFailure.code("INPUT_LIMIT") }
         let script = URL(fileURLWithPath: configuration.projectRoot).appendingPathComponent(
@@ -470,7 +570,7 @@ struct StdioChatProvider: ChatProviding {
         catch { throw ChatFailure.code("CHAT_PROCESS_FAILED") }
         controller.didStart()
         let timeout = DispatchWorkItem { if process.isRunning { controller.cancel(timedOut: true) } }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 260, execute: timeout)
+        DispatchQueue.global().asyncAfter(deadline: .now() + (request.project == nil ? 260 : 580), execute: timeout)
         defer {
             timeout.cancel()
             if process.isRunning { controller.terminateForCleanup(); process.waitUntilExit() }
@@ -482,9 +582,11 @@ struct StdioChatProvider: ChatProviding {
         try input.fileHandleForWriting.close()
         var parser = ChatEventParser(requestID: request.request_id, model: request.model, fixtureOnly: fixtureOnly,
                                      provider: request.provider,
+                                     projectExecution: request.project != nil,
                                      knownSecrets: [request.apiKey, request.subscriptionToken].compactMap { $0 })
         var pending = Data()
         var totalBytes = 0
+        let maximumStreamBytes = request.project == nil ? 33_554_432 : 67_108_864
         var buffer = [UInt8](repeating: 0, count: 4096)
         while true {
             let count = Darwin.read(output.fileHandleForReading.fileDescriptor, &buffer, buffer.count)
@@ -494,7 +596,7 @@ struct StdioChatProvider: ChatProviding {
             }
             if count == 0 { break }
             totalBytes += count
-            guard totalBytes <= 33_554_432 else { throw ChatFailure.code("CHAT_OUTPUT_TOO_LARGE") }
+            guard totalBytes <= maximumStreamBytes else { throw ChatFailure.code("CHAT_OUTPUT_TOO_LARGE") }
             pending.append(contentsOf: buffer.prefix(count))
             while let newline = pending.firstIndex(of: 10) {
                 var frame = pending.subdata(in: 0..<newline)

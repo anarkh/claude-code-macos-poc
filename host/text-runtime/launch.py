@@ -16,6 +16,62 @@ import time
 from common import ROOT, build_seed, public_file, validate_base
 
 
+class ProjectDirectory:
+    """Keep the explicitly selected directory identity pinned until VM exit."""
+
+    def __init__(self, path):
+        path = Path(path)
+        if not path.is_absolute() or '\x00' in str(path) or '..' in path.parts:
+            raise RuntimeError('project_directory_path')
+        selected = path.lstat()
+        if not stat.S_ISDIR(selected.st_mode):
+            raise RuntimeError('project_directory_not_directory')
+        self.path = path.resolve(strict=True)
+        self.descriptor = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        self.metadata = os.fstat(self.descriptor)
+        try:
+            if (selected.st_dev, selected.st_ino) != (self.metadata.st_dev, self.metadata.st_ino):
+                raise RuntimeError('project_directory_changed')
+            self.verify()
+        except BaseException:
+            os.close(self.descriptor)
+            self.descriptor = None
+            raise
+
+    def verify(self):
+        current = self.path.lstat()
+        opened = os.fstat(self.descriptor)
+        if (not stat.S_ISDIR(current.st_mode) or self.path.resolve(strict=True) != self.path or
+                (current.st_dev, current.st_ino) != (self.metadata.st_dev, self.metadata.st_ino) or
+                (opened.st_dev, opened.st_ino) != (self.metadata.st_dev, self.metadata.st_ino)):
+            raise RuntimeError('project_directory_changed')
+        if not os.access(self.path, os.R_OK | os.W_OK | os.X_OK):
+            raise RuntimeError('project_directory_access')
+
+    def arguments(self):
+        self.verify()
+        return ['project', str(self.path), str(self.metadata.st_dev), str(self.metadata.st_ino)]
+
+    def close(self):
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+
+
+def runtime_files(guest, *, fixture=False, probe=False, project=False):
+    files = [public_file(guest / 'bootstrap.sh', '/opt/claude-text/bootstrap.sh', '0700'),
+             public_file(guest / 'supervisor.py', '/opt/claude-text/supervisor.py', '0700'),
+             public_file(guest / ('fixture.mjs' if fixture else 'runtime.mjs'), '/opt/claude-text/sdk/runtime.mjs', '0644')]
+    if probe:
+        files += [public_file(guest / 'privacy_probe.py', '/opt/claude-text/privacy_probe.py', '0644'),
+                  {'path': '/etc/claude-text/probe-enabled', 'owner': 'root:root', 'permissions': '0600', 'content': 'synthetic-probe-only\n'}]
+    if project:
+        # A fixed capability flag is the only project metadata copied into seed.
+        files.append({'path': '/etc/claude-text/project-enabled', 'owner': 'root:root',
+                      'permissions': '0644', 'content': 'project-v1\n'})
+    return files
+
+
 def private_run_root(path):
     if not path.is_absolute() or '\x00' in str(path) or '..' in path.parts:
         raise RuntimeError('private_run_root_path')
@@ -39,10 +95,12 @@ def main():
     parser.add_argument('--fixture', action='store_true')
     parser.add_argument('--evidence-dir', type=Path)
     parser.add_argument('--run-root', type=Path)
+    parser.add_argument('--project-directory', type=Path)
     args = parser.parse_args()
     if not 30 <= args.timeout <= 600:
         raise RuntimeError('timeout_bound')
     helper = None
+    project = None
     state = {'stopped': False, 'stderr_bytes': 0, 'signal': None, 'stop_requested_at': None}
     owned = None
     began = time.monotonic()
@@ -74,6 +132,8 @@ def main():
             raise InterruptedError('launch_cancelled')
 
     try:
+        if args.project_directory is not None:
+            project = ProjectDirectory(args.project_directory)
         validate_base(args.image_dir)
         check_cancelled()
         run_root = private_run_root(args.run_root) if args.run_root else Path('/private/tmp')
@@ -85,18 +145,18 @@ def main():
         for name in ('kernel', 'initrd'):
             shutil.copyfile(args.image_dir / name, owned / name)
         guest = args.guest_runtime_dir
-        files = [public_file(guest / 'bootstrap.sh', '/opt/claude-text/bootstrap.sh', '0700'),
-                 public_file(guest / 'supervisor.py', '/opt/claude-text/supervisor.py', '0700'),
-                 public_file(guest / ('fixture.mjs' if args.fixture else 'runtime.mjs'), '/opt/claude-text/sdk/runtime.mjs', '0644')]
-        if args.probe:
-            files += [public_file(guest / 'privacy_probe.py', '/opt/claude-text/privacy_probe.py', '0644'),
-                      {'path': '/etc/claude-text/probe-enabled', 'owner': 'root:root', 'permissions': '0600', 'content': 'synthetic-probe-only\n'}]
+        files = runtime_files(guest, fixture=args.fixture, probe=args.probe, project=project is not None)
         seed = build_seed(owned, files, [['sh', '-c',
             'bash /opt/claude-text/bootstrap.sh > /dev/hvc0 2>&1; code=$?; echo TEXT_GUEST_EXIT=$code > /dev/hvc0']])
         check_cancelled()
-        helper = subprocess.Popen([str(args.runner.absolute()), 'boot', str(owned), str(seed),
-                                   str(owned / 'serial.log'), str(args.timeout)],
+        command = [str(args.runner.absolute()), 'boot', str(owned), str(seed),
+                   str(owned / 'serial.log'), str(args.timeout)]
+        if project is not None:
+            command += project.arguments()
+        helper = subprocess.Popen(command,
                                   stdin=None, stdout=None, stderr=subprocess.PIPE, close_fds=True)
+        if project is not None:
+            project.verify()
 
         def read_diagnostics():
             while True:
@@ -156,6 +216,8 @@ def main():
                 state['stopped'] = False
         if owned:
             shutil.rmtree(owned)
+        if project is not None:
+            project.close()
         cleanup_complete = owned is None or not owned.exists()
     if not state['stopped'] or not cleanup_complete:
         code = 2

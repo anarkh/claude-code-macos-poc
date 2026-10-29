@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import SwiftUI
 
@@ -25,13 +26,17 @@ final class ExecutionViewModel: ObservableObject {
     private let credentials: any AppCredentialStoring
     private let subscriptionCredentials: any AppCredentialStoring
     private let tester: (any ExecutionConnectionTesting)?
+    let subscriptionAccounts: SubscriptionAccountsModel?
+    private var accountObservation: AnyCancellable?
 
     init(store: ExecutionConfigurationStore = .init(), credentials: any AppCredentialStoring = FileCredentialStore(scope: .execution),
-         subscriptionCredentials: any AppCredentialStoring = FileCredentialStore(scope: .subscription), tester: (any ExecutionConnectionTesting)? = nil) {
+         subscriptionCredentials: any AppCredentialStoring = FileCredentialStore(scope: .subscription), tester: (any ExecutionConnectionTesting)? = nil,
+         subscriptionAccounts: SubscriptionAccountsModel? = nil) {
         self.store = store
         self.credentials = credentials
         self.subscriptionCredentials = subscriptionCredentials
         self.tester = tester
+        self.subscriptionAccounts = subscriptionAccounts
         switch store.load() {
         case .missing: break
         case .configured(let profile):
@@ -39,10 +44,15 @@ final class ExecutionViewModel: ObservableObject {
             modelName = profile.model
             provider = profile.provider
             subscriptionModel = profile.subscriptionModel
-            configurationStatus = "公开配置已保存；启动时未读取密钥。"
+            configurationStatus = subscriptionAccounts == nil ? "公开配置已保存；启动时未读取密钥。" : "模型配置已保存；订阅账号独立管理。"
         case .invalid(let failure):
             configurationStatus = "已保存配置无效。"
             error = failure.message
+        }
+        accountObservation = subscriptionAccounts?.$catalog.dropFirst().sink { [weak self] _ in
+            self?.testStatus = nil
+            if self?.provider == .claudeSubscription { self?.error = nil }
+            self?.objectWillChange.send()
         }
     }
 
@@ -126,6 +136,10 @@ final class ExecutionViewModel: ObservableObject {
 
     func saveSubscriptionToken() {
         guard !isWorkSuspended else { error = isTerminationInProgress ? "正在退出 App，请等待任务停止。" : "正在清理登录，请等待完成。"; return }
+        guard subscriptionAccounts == nil else {
+            error = "请在账号列表中更新对应账号的 Token。"
+            return
+        }
         do {
             try LocalCredentialFailure.validate(subscriptionToken, scope: .subscription)
             try subscriptionCredentials.save(subscriptionToken)
@@ -137,6 +151,10 @@ final class ExecutionViewModel: ObservableObject {
 
     func loadSubscriptionToken() {
         guard !isWorkSuspended else { error = isTerminationInProgress ? "正在退出 App，请等待任务停止。" : "正在清理登录，请等待完成。"; return }
+        guard subscriptionAccounts == nil else {
+            error = "请在账号列表中选择要使用的账号。"
+            return
+        }
         do {
             guard let token = try subscriptionCredentials.load() else {
                 error = "本 App 尚未保存订阅 Token，请先运行 claude setup-token 并粘贴结果。"
@@ -152,6 +170,7 @@ final class ExecutionViewModel: ObservableObject {
 
     func restoreSavedSubscriptionTokenForSettings() {
         guard !isWorkSuspended else { error = isTerminationInProgress ? "正在退出 App，请等待任务停止。" : "正在清理登录，请等待完成。"; return }
+        guard subscriptionAccounts == nil else { return }
         guard subscriptionToken.isEmpty else { return }
         do {
             guard let token = try subscriptionCredentials.load() else {
@@ -167,6 +186,10 @@ final class ExecutionViewModel: ObservableObject {
 
     func deleteSubscriptionToken() {
         guard !isWorkSuspended else { error = isTerminationInProgress ? "正在退出 App，请等待任务停止。" : "正在清理登录，请等待完成。"; return }
+        guard subscriptionAccounts == nil else {
+            error = "请在账号列表中清除对应账号的授权。"
+            return
+        }
         do {
             try subscriptionCredentials.delete()
             subscriptionToken = ""
@@ -176,29 +199,43 @@ final class ExecutionViewModel: ObservableObject {
         catch { self.error = "无法删除订阅 Token，请检查本机凭据文件的访问权限。" }
     }
 
-    var isTerminationWorkSettled: Bool { !testBusy && connectionTask == nil }
+    var isTerminationWorkSettled: Bool {
+        !testBusy && connectionTask == nil && (subscriptionAccounts?.isRefreshSettled ?? true)
+    }
     func beginTermination() {
         isTerminationInProgress = true
         connectionTask?.cancel()
+        subscriptionAccounts?.cancelRefreshes()
     }
     func endTermination() { isTerminationInProgress = false }
 
     func beginLoginReset() {
         isLoginResetInProgress = true
         connectionTask?.cancel()
+        subscriptionAccounts?.cancelRefreshes()
     }
 
     func drainForLoginReset(timeoutSeconds: Double = 8) async throws {
         guard isLoginResetInProgress else { throw LoginResetLifecycleFailure.notStarted }
-        try await waitForLoginReset(timeoutSeconds: timeoutSeconds) { !self.testBusy && self.connectionTask == nil }
+        try await waitForLoginReset(timeoutSeconds: timeoutSeconds) { self.isTerminationWorkSettled }
     }
 
     func endLoginReset() { isLoginResetInProgress = false }
 
     func clearSubscriptionForLoginReset() throws {
         guard isLoginResetInProgress else { throw LoginResetLifecycleFailure.notStarted }
-        guard !testBusy, connectionTask == nil, OwnedProcessRegistry.shared.activeCount == 0 else {
+        guard isTerminationWorkSettled, OwnedProcessRegistry.shared.activeCount == 0 else {
             throw LoginResetLifecycleFailure.workStillRunning
+        }
+        if let subscriptionAccounts {
+            try subscriptionAccounts.clearCurrentCredentialForReset()
+            clearingSubscriptionForReset = true
+            subscriptionToken = ""
+            clearingSubscriptionForReset = false
+            testStatus = nil
+            subscriptionCredentialStatus = "当前账号的授权已清除，其他账号已保留。"
+            error = nil
+            return
         }
         try subscriptionCredentials.delete()
         // Clear the bound input after disk commit even if readback fails; an old
@@ -237,15 +274,20 @@ final class ExecutionViewModel: ObservableObject {
             guard let tester else { throw ExecutionConnectionFailure(code: "BRIDGE_MISSING") }
             if provider == .claudeSubscription {
                 guard ["sonnet", "opus", "haiku"].contains(subscriptionModel) else { throw ExecutionConnectionFailure(code: "INVALID_PROFILE") }
-                if subscriptionToken.isEmpty {
+                let accountSelection = try subscriptionAccounts?.currentSelection()
+                if subscriptionAccounts == nil && subscriptionToken.isEmpty {
                     loadSubscriptionToken()
                     guard !subscriptionToken.isEmpty else { testStatus = "连接测试未通过。"; return }
                 }
-                try LocalCredentialFailure.validate(subscriptionToken, scope: .subscription)
-                let selectedToken = subscriptionToken, selectedModel = subscriptionModel
+                let selectedToken = accountSelection?.token ?? subscriptionToken, selectedModel = subscriptionModel
+                try LocalCredentialFailure.validate(selectedToken, scope: .subscription)
                 let result = try await ownedConnectionTest { try await tester.testSubscription(token: selectedToken, model: selectedModel) }
                 try Task.checkCancellation()
-                guard provider == .claudeSubscription, subscriptionToken == selectedToken, subscriptionModel == selectedModel else {
+                let currentSelection = try subscriptionAccounts?.currentSelection()
+                guard provider == .claudeSubscription, subscriptionModel == selectedModel,
+                      currentSelection?.id == accountSelection?.id,
+                      currentSelection?.credentialVersion == accountSelection?.credentialVersion,
+                      (currentSelection?.token ?? subscriptionToken) == selectedToken else {
                     throw ExecutionConnectionFailure(code: "CONFIG_CHANGED")
                 }
                 testStatus = "官方 CLI 已通过 Claude 订阅文本连接测试：\(result.ack ?? "")。工具关闭。"
@@ -273,6 +315,7 @@ final class ExecutionViewModel: ObservableObject {
             error = nil
         } catch is CancellationError { testStatus = "连接测试已停止。"; error = nil }
         catch let failure as LocalCredentialFailure { error = provider == .claudeSubscription ? failure.subscriptionMessage : failure.message; testStatus = "连接测试未通过。" }
+        catch let failure as SubscriptionAccountSelectionFailure { error = failure.message; testStatus = "连接测试未通过。" }
         catch let failure as ExecutionConnectionFailure { error = failure.message; testStatus = "连接测试未通过。" }
         catch { self.error = "连接测试发生错误；未启动项目工具。"; testStatus = "连接测试未通过。" }
     }

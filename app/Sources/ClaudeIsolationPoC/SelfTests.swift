@@ -31,6 +31,13 @@ func runSelfTests() async -> Int32 {
     for (name, passed) in executionConfigurationChecks() { check(passed, name) }
     for (name, passed) in executionViewModelChecks() { check(passed, name) }
     for (name, passed) in localCredentialStoreChecks() { check(passed, name) }
+    for (name, passed) in subscriptionAccountStoreChecks() { check(passed, name) }
+    for (name, passed) in subscriptionQuotaChecks() { check(passed, name) }
+    for (name, passed) in await subscriptionAccountsModelChecks() { check(passed, name) }
+    for (name, passed) in await subscriptionAccountsIntegrationChecks() { check(passed, name) }
+    for (name, passed) in installationIdentityChecks() { check(passed, name) }
+    for (name, passed) in deviceIdentitySettingsChecks() { check(passed, name) }
+    for (name, passed) in diagnosticsSettingsChecks() { check(passed, name) }
     for (name, passed) in translationCredentialChecks() { check(passed, name) }
     for (name, passed) in credentialSettingsRestoreChecks() { check(passed, name) }
     for (name, passed) in subscriptionSettingsChecks() { check(passed, name) }
@@ -46,8 +53,10 @@ func runSelfTests() async -> Int32 {
     for (name, passed) in runtimeProfileChecks() { check(passed, name) }
     for (name, passed) in runtimeTimeZoneCatalogChecks() { check(passed, name) }
     for (name, passed) in conversationStoreChecks() { check(passed, name) }
+    for (name, passed) in projectDirectoryChecks() { check(passed, name) }
     for (name, passed) in textSkillsChecks() { check(passed, name) }
     for (name, passed) in chatExecutionChecks() { check(passed, name) }
+    for (name, passed) in projectChatBridgeChecks() { check(passed, name) }
     for (name, passed) in requestTraceChecks() { check(passed, name) }
     for (name, passed) in await conversationViewModelChecks() { check(passed, name) }
     for (name, passed) in await executionConnectionViewModelChecks() { check(passed, name) }
@@ -133,7 +142,10 @@ func runSelfTests() async -> Int32 {
             for (name, passed) in await chatExecutionFixtureChecks(configuration: configuration) { check(passed, name) }
             for (name, passed) in await loginResetStdioChecks(configuration: configuration) { check(passed, name) }
             for (name, passed) in await networkBridgeChecks(configuration: configuration) { check(passed, name) }
+            for (name, passed) in await subscriptionQuotaBridgeChecks(configuration: configuration) { check(passed, name) }
             for (name, passed) in await runtimeBridgeChecks(configuration: configuration) { check(passed, name) }
+            for (name, passed) in await installationIdentityBridgeChecks(configuration: configuration) { check(passed, name) }
+            for (name, passed) in await projectStdioBridgeChecks(configuration: configuration) { check(passed, name) }
             let liveFixture = TranslationViewModel(provider: StdioTranslationProvider(configuration: configuration, fixtureOnly: true))
             liveFixture.apiKey = "fixture-only-value-not-sent-to-real-service"
             liveFixture.inputText = "请解释 `foo()`"

@@ -11,9 +11,15 @@ import { inspectInstalledNativeMetadata } from './deepseek-text-smoke.mjs';
 import { ProxyTransportError, proxyHttpsRequest, validateNetworkPolicy } from '../network/proxy-transport.mjs';
 import { DEFAULT_RUNTIME_PROFILE, RuntimeProfileError, profileEnvironment, validateRuntimeProfile } from '../runtime/profile.mjs';
 import { createRequestTrace, PROVIDER_URL, SUBSCRIPTION_URL } from './request-trace.mjs';
+import { PROJECT_TOOLS, PROJECT_SYSTEM_PROMPT,
+  projectProviderMessages } from './project-provider-protocol.mjs';
+export { PROJECT_EXECUTION_CONTRACT } from './project-provider-protocol.mjs';
 
 export const CHAT_SCHEMA = 'deepseek-text-chat/v1';
 export const EVENT_SCHEMA = 'deepseek-text-chat-event/v1';
+// Package-level capability for the App-owned installation/conversation identity.
+// Older signed runtime packages omit this export and remain usable without it.
+export const TEXT_IDENTITY_CONTRACT = 'app-install-conversation/v1';
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const MODELS = new Set(['deepseek-flash[1m]', 'deepseek-flash']);
 const SUBSCRIPTION_MODELS = new Set(['sonnet', 'opus', 'haiku']);
@@ -45,7 +51,7 @@ const fail = code => { throw new ChatFailure(code); };
 
 export function validateInput(input, testOnly = false) {
   if (!input || typeof input !== 'object' || Array.isArray(input) || input.schema !== CHAT_SCHEMA ||
-      Object.keys(input).some(key => !['schema', 'request_id', 'provider', 'apiKey', 'subscriptionToken', 'model', 'messages', 'text_skills', 'network', 'runtime'].includes(key))) fail('INVALID_INPUT');
+      Object.keys(input).some(key => !['schema', 'request_id', 'provider', 'apiKey', 'subscriptionToken', 'model', 'messages', 'text_skills', 'network', 'runtime', 'identity', 'project'].includes(key))) fail('INVALID_INPUT');
   if (typeof input.request_id !== 'string' || !UUID.test(input.request_id)) fail('INVALID_REQUEST_ID');
   const provider = input.provider === undefined ? 'deepseek-api' : input.provider;
   if (!PROVIDERS.has(provider)) fail('PROVIDER_NOT_ALLOWED');
@@ -58,6 +64,27 @@ export function validateInput(input, testOnly = false) {
     if (typeof input.subscriptionToken !== 'string' || input.subscriptionToken.length < 16 || input.subscriptionToken.length > 4096 ||
         !/^sk-ant-oat01-[A-Za-z0-9_-]+$/.test(input.subscriptionToken)) fail('INVALID_SUBSCRIPTION_TOKEN');
     if (!SUBSCRIPTION_MODELS.has(input.model)) fail('MODEL_NOT_ALLOWED');
+  }
+  let identity;
+  if (input.identity !== undefined) {
+    const value = input.identity;
+    if (provider !== 'claude-subscription' || !value || typeof value !== 'object' || Array.isArray(value) ||
+        Object.keys(value).length !== 2 || Object.keys(value).some(key => !['device_id', 'session_id'].includes(key)) ||
+        typeof value.device_id !== 'string' || !/^[a-f0-9]{64}$/.test(value.device_id) ||
+        typeof value.session_id !== 'string' || !UUID.test(value.session_id)) fail('INVALID_IDENTITY');
+    identity = { device_id: value.device_id, session_id: value.session_id.toLowerCase() };
+  }
+  // Input admission is syntactic only. Filesystem authorization occurs at the
+  // real VM launch boundary, never while validating synthetic/offline input.
+  let project;
+  if (input.project !== undefined) {
+    const value = input.project;
+    if (!value || typeof value !== 'object' || Array.isArray(value) ||
+        Object.keys(value).length !== 1 || !Object.hasOwn(value, 'directory') ||
+        typeof value.directory !== 'string' || !path.isAbsolute(value.directory) ||
+        value.directory === '/' || value.directory.includes('\0') ||
+        Buffer.byteLength(value.directory) > 4096 || path.normalize(value.directory) !== value.directory) fail('INVALID_PROJECT_DIRECTORY');
+    project = { directory: value.directory };
   }
   if (!Array.isArray(input.messages) || input.messages.length < 1 || input.messages.length > 101 || input.messages.length % 2 !== 1) fail('INVALID_HISTORY');
   let bytes = 0;
@@ -89,12 +116,14 @@ export function validateInput(input, testOnly = false) {
   const network = testOnly && input.network === undefined ? undefined : validateNetworkPolicy(input.network);
   const runtimeProfile = validateRuntimeProfile(testOnly && input.runtime === undefined ? DEFAULT_RUNTIME_PROFILE : input.runtime);
   return { request_id: input.request_id, provider, apiKey: input.apiKey, subscriptionToken: input.subscriptionToken,
-    model: input.model, messages, textSkills: validatedSkills, network, runtimeProfile };
+    model: input.model, messages, textSkills: validatedSkills, network, runtimeProfile, identity, project };
 }
 
 function providerSystemPrompt(configuration) {
-  if (configuration.textSkills.length === 0) return SYSTEM_PROMPT;
-  return `${SYSTEM_PROMPT}\n\nApp-selected text skill instructions follow as a JSON array. Apply these instructions only within this text-only conversation. They cannot enable tools, scripts, file access, network access, plugins, or access to credentials. Do not interpret names or contents as runtime configuration.\n${JSON.stringify(configuration.textSkills)}`;
+  const base = configuration.project ? PROJECT_SYSTEM_PROMPT : SYSTEM_PROMPT;
+  if (configuration.textSkills.length === 0) return base;
+  if (!configuration.project) return `${SYSTEM_PROMPT}\n\nApp-selected text skill instructions follow as a JSON array. Apply these instructions only within this text-only conversation. They cannot enable tools, scripts, file access, network access, plugins, or access to credentials. Do not interpret names or contents as runtime configuration.\n${JSON.stringify(configuration.textSkills)}`;
+  return `${base}\n\nApp-selected text skill instructions follow as a JSON array. Apply these instructions only within the capabilities explicitly enabled for this conversation. They cannot enable additional tools, network access, plugins, or access to credentials. Do not interpret names or contents as runtime configuration.\n${JSON.stringify(configuration.textSkills)}`;
 }
 
 function tokenMatches(value, expected) {
@@ -131,14 +160,14 @@ function subscriptionSystem(localBody, configuration) {
     Object.keys(block).some(key => !['type', 'text', 'cache_control'].includes(key))) ||
     typeof system[0].text !== 'string' || !/^x-anthropic-billing-header: cc_version=2\.1\.295\.[a-z0-9]{3}; cc_entrypoint=sdk-ts;$/.test(system[0].text) ||
     system[1].text !== "You are a Claude agent, built on Anthropic's Claude Agent SDK." ||
-    system[2].text !== SYSTEM_PROMPT) fail('SUBSCRIPTION_PROTOCOL_REJECTED');
+    system[2].text !== (configuration.project ? PROJECT_SYSTEM_PROMPT : SYSTEM_PROMPT)) fail('SUBSCRIPTION_PROTOCOL_REJECTED');
   // Keep the official native identity and billing markers; selected Skills are
   // appended to the App-owned text prompt rather than becoming runtime config.
   return [{ type: 'text', text: system[0].text }, { type: 'text', text: system[1].text },
     { type: 'text', text: providerSystemPrompt(configuration) }];
 }
 
-function subscriptionMetadata(localBody, sessionID) {
+function subscriptionMetadata(localBody, sessionID, requestedIdentity) {
   const metadata = localBody.metadata;
   if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata) || Object.keys(metadata).length !== 1 ||
       typeof metadata.user_id !== 'string' || metadata.user_id.length > 512) fail('SUBSCRIPTION_PROTOCOL_REJECTED');
@@ -149,6 +178,8 @@ function subscriptionMetadata(localBody, sessionID) {
       typeof identity.device_id !== 'string' || !/^[a-f0-9]{64}$/.test(identity.device_id) ||
       !(identity.account_uuid === '' || typeof identity.account_uuid === 'string' && UUID.test(identity.account_uuid)) ||
       identity.session_id !== sessionID) fail('SUBSCRIPTION_PROTOCOL_REJECTED');
+  if (requestedIdentity && (identity.device_id !== requestedIdentity.device_id ||
+      identity.session_id !== requestedIdentity.session_id || identity.account_uuid !== '')) fail('NATIVE_IDENTITY_MISMATCH');
   // Rebuild only validated attribution fields. The original JSON can contain
   // duplicate keys whose earlier, unvalidated values JSON.parse discards.
   return { user_id: JSON.stringify({ device_id: identity.device_id,
@@ -157,6 +188,20 @@ function subscriptionMetadata(localBody, sessionID) {
 
 export function providerBody(localBody, configuration, nativeModel, sessionID) {
   const latest = configuration.messages.at(-1).text;
+  if (configuration.project) {
+    if (!localBody || typeof localBody !== 'object' || Array.isArray(localBody) ||
+        Object.keys(localBody).some(key => !['model', 'stream', 'max_tokens', 'thinking', 'tools', 'system', 'metadata',
+          'messages', 'temperature', 'context_management', 'output_config'].includes(key)) ||
+        (configuration.provider === 'claude-subscription' ?
+          localBody.model !== nativeModel || !isSubscriptionModel(localBody.model, configuration.model) :
+          ![configuration.model, configuration.model.replace('[1m]', '')].includes(localBody.model)) ||
+        localBody.stream !== true) fail('PROJECT_PROTOCOL_REJECTED');
+    const { tools, messages } = projectProviderMessages(localBody, configuration);
+    return { model: configuration.provider === 'claude-subscription' ? nativeModel : configuration.model.replace('[1m]', ''),
+      stream: true, max_tokens: 4096, thinking: { type: 'disabled' }, tools,
+      system: configuration.provider === 'claude-subscription' ? subscriptionSystem(localBody, configuration) : providerSystemPrompt(configuration),
+      ...(configuration.provider === 'claude-subscription' ? { metadata: subscriptionMetadata(localBody, sessionID, configuration.identity) } : {}), messages };
+  }
   if (!localBody || typeof localBody !== 'object' || Array.isArray(localBody) ||
       (configuration.provider === 'claude-subscription' ?
         localBody.model !== nativeModel || !isSubscriptionModel(localBody.model, configuration.model) :
@@ -187,7 +232,7 @@ export function providerBody(localBody, configuration, nativeModel, sessionID) {
   return { model: configuration.provider === 'claude-subscription' ? nativeModel : configuration.model.replace('[1m]', ''), stream: true, max_tokens: 4096,
     thinking: { type: 'disabled' }, tools: [], system: configuration.provider === 'claude-subscription' ?
       subscriptionSystem(localBody, configuration) : providerSystemPrompt(configuration),
-    ...(configuration.provider === 'claude-subscription' ? { metadata: subscriptionMetadata(localBody, sessionID) } : {}),
+    ...(configuration.provider === 'claude-subscription' ? { metadata: subscriptionMetadata(localBody, sessionID, configuration.identity) } : {}),
     messages: configuration.messages.map(message => ({ role: message.role, content: message.text })) };
 }
 
@@ -211,11 +256,11 @@ export async function officialTransport({ body, apiKey, provider, subscriptionTo
 
 // Serialize and capture the exact wire request before officialTransport inserts
 // the credential. Offline transports receive the unchanged existing test API.
-export async function tracedProviderRequest(parameters, { emit, requestID, attempt, transport = officialTransport, secrets = [] }) {
+export async function tracedProviderRequest(parameters, { emit, requestID, attempt, project = false, transport = officialTransport, secrets = [] }) {
   const payload = Buffer.from(JSON.stringify(parameters.body));
   const headers = { ...parameters.headers, 'anthropic-version': '2023-06-01',
     'content-type': 'application/json', 'content-length': String(payload.length) };
-  const trace = createRequestTrace({ requestID, attempt, provider: parameters.provider,
+  const trace = createRequestTrace({ requestID, attempt, project, provider: parameters.provider,
     url: parameters.provider === 'claude-subscription' ? SUBSCRIPTION_URL : PROVIDER_URL,
     wireModel: parameters.body.model, payload, headers, network: parameters.network,
     secrets: [parameters.apiKey, parameters.subscriptionToken, ...secrets], emit });
@@ -245,7 +290,9 @@ function fixtureRuntime(dependencies) {
   return dependencies;
 }
 
-export async function relaySse(upstream, response, onText, signal) {
+export async function relaySse(upstream, response, onText, signal, options) {
+  if (options !== undefined && (!options || options.project !== true || typeof options.onTool !== 'function' ||
+      Object.keys(options).some(key => !['project', 'onTool'].includes(key)))) fail('PROVIDER_PROTOCOL_REJECTED');
   if (!upstream.stream || typeof upstream.stream[Symbol.asyncIterator] !== 'function') fail('PROVIDER_PROTOCOL_REJECTED');
   const decoder = new TextDecoder('utf-8', { fatal: true });
   let pending = '';
@@ -253,7 +300,9 @@ export async function relaySse(upstream, response, onText, signal) {
   let frameCount = 0;
   let started = false;
   let stopped = false;
-  const openBlocks = new Set();
+  const openBlocks = new Map();
+  const usedBlocks = new Set(), toolIDs = new Set();
+  let stopReason;
   const consume = frame => {
     if (++frameCount > 8192 || Buffer.byteLength(frame, 'utf8') > FRAME_LIMIT) fail('PROVIDER_RESPONSE_LIMIT');
     const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n');
@@ -268,20 +317,53 @@ export async function relaySse(upstream, response, onText, signal) {
           !Array.isArray(value.message.content) || value.message.content.length !== 0) fail('PROVIDER_PROTOCOL_REJECTED');
       started = true;
     } else if (value.type === 'content_block_start') {
-      if (!started || !Number.isSafeInteger(value.index) || value.index < 0 || openBlocks.has(value.index) ||
-          value.content_block?.type !== 'text' || typeof value.content_block.text !== 'string') fail(value.content_block?.type === 'tool_use' ? 'PROVIDER_TOOL_RESPONSE' : 'PROVIDER_PROTOCOL_REJECTED');
-      openBlocks.add(value.index);
-      if (value.content_block.text.length) onText(value.content_block.text);
+      const block = value.content_block;
+      if (!started || stopReason !== undefined || !Number.isSafeInteger(value.index) || value.index < 0 ||
+          usedBlocks.has(value.index)) fail('PROVIDER_PROTOCOL_REJECTED');
+      usedBlocks.add(value.index);
+      if (block?.type === 'text' && typeof block.text === 'string') {
+        openBlocks.set(value.index, { type: 'text' });
+        if (block.text.length) onText(block.text);
+      } else if (block?.type === 'tool_use') {
+        if (!options?.project) fail('PROVIDER_TOOL_RESPONSE');
+        if (!block || Object.keys(block).some(key => !['type', 'id', 'name', 'input', 'caller'].includes(key)) ||
+            typeof block.id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(block.id) || toolIDs.has(block.id) ||
+            !PROJECT_TOOLS.includes(block.name) || !block.input || typeof block.input !== 'object' || Array.isArray(block.input) ||
+            Object.keys(block.input).length !== 0 || (block.caller !== undefined &&
+              (!block.caller || Object.keys(block.caller).length !== 1 || block.caller.type !== 'direct'))) fail('PROVIDER_TOOL_RESPONSE');
+        toolIDs.add(block.id);
+        if (toolIDs.size > 64) fail('PROVIDER_RESPONSE_LIMIT');
+        openBlocks.set(value.index, { type: 'tool_use', id: block.id, name: block.name, json: '' });
+      } else fail('PROVIDER_PROTOCOL_REJECTED');
     } else if (value.type === 'content_block_delta') {
-      if (!started || !openBlocks.has(value.index) || value.delta?.type !== 'text_delta' || typeof value.delta.text !== 'string') fail(value.delta?.type === 'input_json_delta' ? 'PROVIDER_TOOL_RESPONSE' : 'PROVIDER_PROTOCOL_REJECTED');
-      if (value.delta.text.length) onText(value.delta.text);
+      const block = openBlocks.get(value.index);
+      if (!started || stopReason !== undefined || !block) fail('PROVIDER_PROTOCOL_REJECTED');
+      if (block.type === 'text' && value.delta?.type === 'text_delta' && typeof value.delta.text === 'string') {
+        if (value.delta.text.length) onText(value.delta.text);
+      } else if (block.type === 'tool_use' && value.delta?.type === 'input_json_delta' && typeof value.delta.partial_json === 'string') {
+        block.json += value.delta.partial_json;
+        if (Buffer.byteLength(block.json) > FRAME_LIMIT) fail('PROVIDER_RESPONSE_LIMIT');
+      } else fail(value.delta?.type === 'input_json_delta' ? 'PROVIDER_TOOL_RESPONSE' : 'PROVIDER_PROTOCOL_REJECTED');
     } else if (value.type === 'content_block_stop') {
-      if (!openBlocks.delete(value.index)) fail('PROVIDER_PROTOCOL_REJECTED');
+      const block = openBlocks.get(value.index);
+      if (!block || !openBlocks.delete(value.index)) fail('PROVIDER_PROTOCOL_REJECTED');
+      if (block.type === 'tool_use') {
+        let input;
+        try { input = JSON.parse(block.json || '{}'); } catch { fail('PROVIDER_TOOL_RESPONSE'); }
+        if (!input || typeof input !== 'object' || Array.isArray(input)) fail('PROVIDER_TOOL_RESPONSE');
+        options.onTool({ id: block.id, name: block.name, input });
+      }
     } else if (value.type === 'message_delta') {
-      if (!started || value.delta?.stop_reason === 'tool_use') fail(value.delta?.stop_reason === 'tool_use' ? 'PROVIDER_TOOL_RESPONSE' : 'PROVIDER_PROTOCOL_REJECTED');
+      if (!started || (!options?.project && value.delta?.stop_reason === 'tool_use')) fail(value.delta?.stop_reason === 'tool_use' ? 'PROVIDER_TOOL_RESPONSE' : 'PROVIDER_PROTOCOL_REJECTED');
+      if (options?.project) {
+        if (openBlocks.size || stopReason !== undefined ||
+            !['end_turn', 'max_tokens', 'tool_use'].includes(value.delta?.stop_reason) ||
+            (value.delta.stop_reason === 'tool_use') !== (toolIDs.size > 0)) fail('PROVIDER_PROTOCOL_REJECTED');
+        stopReason = value.delta.stop_reason;
+      }
       if (Number.isSafeInteger(value.usage?.output_tokens) && value.usage.output_tokens > 4096) fail('PROVIDER_OUTPUT_LIMIT');
     } else if (value.type === 'message_stop') {
-      if (!started || openBlocks.size) fail('PROVIDER_PROTOCOL_REJECTED');
+      if (!started || openBlocks.size || (options?.project && stopReason === undefined)) fail('PROVIDER_PROTOCOL_REJECTED');
       stopped = true;
     } else if (value.type !== 'ping') fail('PROVIDER_PROTOCOL_REJECTED');
     // Forward only fully decoded, validated protocol frames.
@@ -364,6 +446,10 @@ export async function runDeepSeekTextChat(input, emit, testDependencies) {
   const timer = setTimeout(() => terminate('TOTAL_TIMEOUT'), timeoutMs);
   try {
     configuration = validateInput(input, testDependencies?.testOnly === true);
+    if (configuration.project) fail('VM_PROJECT_REQUIRED');
+    // Stable identity is implemented by the isolated guest, not this legacy
+    // host-native execution path. Never accept it and silently generate another.
+    if (configuration.identity) fail('VM_IDENTITY_UNSUPPORTED');
     phaseCode = 'RUNTIME_INITIALIZATION_FAILED';
     runtime = testDependencies === undefined ? await productionRuntime() : fixtureRuntime(testDependencies);
     phaseCode = 'TEMPORARY_SETUP_FAILED';
@@ -577,6 +663,7 @@ async function readStdin() {
 
 async function runOfflineFixture(input, emit) {
   const configuration = validateInput(input, true);
+  if (configuration.project) fail('VM_PROJECT_REQUIRED');
   const base = { schema: EVENT_SCHEMA, request_id: configuration.request_id, model: configuration.model, fixture_only: true };
   emit({ ...base, type: 'started', no_tools: true });
   const chunks = ['Offline text fixture. ',

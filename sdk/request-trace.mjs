@@ -62,10 +62,10 @@ export function requestTraceErrorCode(error, signal) {
 
 // Nothing from response headers or an error message enters this interface.
 // Each attempt emits one request and one terminal snapshot; the App upserts it
-// by attempt_id and holds at most the existing three admitted CLI requests.
-export function createRequestTrace({ requestID, attempt, provider, url, method = 'POST', wireModel,
+// by attempt_id. Text admits three requests; explicit project turns admit 24.
+export function createRequestTrace({ requestID, attempt, project = false, provider, url, method = 'POST', wireModel,
   headers = {}, payload, network, secrets = [], emit, now = () => performance.now() }) {
-  if (!UUID.test(requestID ?? '') || !Number.isInteger(attempt) || attempt < 1 || attempt > 3 ||
+  if (typeof project !== 'boolean' || !UUID.test(requestID ?? '') || !Number.isInteger(attempt) || attempt < 1 || attempt > (project ? 24 : 3) ||
       !['deepseek-api', 'claude-subscription'].includes(provider) || method !== 'POST' ||
       url !== (provider === 'claude-subscription' ? SUBSCRIPTION_URL : PROVIDER_URL) ||
       typeof wireModel !== 'string' || !wireModel || Buffer.byteLength(wireModel) > 128 ||

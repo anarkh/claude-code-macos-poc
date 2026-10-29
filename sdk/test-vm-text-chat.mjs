@@ -5,12 +5,15 @@ import { PassThrough, Writable } from 'node:stream';
 import { access, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { runVMTextChat } from './vm-text-chat.mjs';
+import { runVMTextChat, validateProjectDirectory } from './vm-text-chat.mjs';
+import { runDeepSeekTextChat, TEXT_IDENTITY_CONTRACT, PROJECT_EXECUTION_CONTRACT, validateInput } from './deepseek-text-chat.mjs';
+import { PROJECT_MOUNT, PROJECT_TOOLS, PROJECT_SYSTEM_PROMPT } from './project-provider-protocol.mjs';
 import { SUBSCRIPTION_INPUT, SUBSCRIPTION_SESSION_ID, subscriptionSSE,
   nativeSubscriptionBody, nativeSubscriptionHeaders } from './subscription-test-fixtures.mjs';
 
 const ACK = 'VM_ONLY_TEXT_OK';
 const requestID = '22222222-2222-4222-8222-222222222222';
+const IDENTITY = { device_id: '7'.repeat(64), session_id: '33333333-3333-4333-8333-333333333333' };
 const TRACE_SCHEMA = 'claude-request-trace/v1';
 const TRACE_LIMIT = 2_097_152;
 const TRACE_HEADERS = ['content-type', 'content-length', 'anthropic-version', 'anthropic-beta',
@@ -18,6 +21,30 @@ const TRACE_HEADERS = ['content-type', 'content-length', 'anthropic-version', 'a
 const deepseek = { ...SUBSCRIPTION_INPUT, provider: 'deepseek-api', model: 'deepseek-flash[1m]',
   apiKey: 'sk-SYNTHETIC-HOST-ONLY-KEY-DO-NOT-SEND-TO-VM' };
 delete deepseek.subscriptionToken;
+
+const projectToolDefinitions = PROJECT_TOOLS.map(name => ({ name, description: `Synthetic ${name} tool`,
+  input_schema: { type: 'object', properties: {}, additionalProperties: true } }));
+// Exact receipt emitted by host/Sources/VMTextRuntime/main.swift for project VMs.
+const projectVMConfiguration = { kind: 'vm_config', network_devices: 0,
+  host_directory_shares: 1, directory_shares: 1, clipboard_devices: 0, graphics_devices: 0,
+  socket_devices: 1, cpu_count: 2, memory_bytes: 2 * 1024 * 1024 * 1024,
+  disposable_disk: true, vsock_port: 40124, project_mount: PROJECT_MOUNT, project_read_only: false };
+const projectUse = (name, index) => ({ type: 'tool_use', id: `tool_${index}`, name, input: { synthetic: true } });
+function projectSSE(text, tool) {
+  const frames = [
+    { type: 'message_start', message: { type: 'message', role: 'assistant', content: [] } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text } },
+    { type: 'content_block_stop', index: 0 },
+    ...(tool ? [{ type: 'content_block_start', index: 1, content_block: { ...tool, input: {} } },
+      { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: JSON.stringify(tool.input) } },
+      { type: 'content_block_stop', index: 1 }] : []),
+    { type: 'message_delta', delta: { stop_reason: tool ? 'tool_use' : 'end_turn' }, usage: { output_tokens: 12 } },
+    { type: 'message_stop' },
+  ];
+  return { statusCode: 200, contentType: 'text/event-stream', stream: (async function* () {
+    for (const frame of frames) yield Buffer.from(`data: ${JSON.stringify(frame)}\n\n`);
+  })() };
+}
 
 function fixture(input = deepseek, options = {}) {
   const received = [], events = [], outbound = [];
@@ -39,8 +66,24 @@ function fixture(input = deepseek, options = {}) {
     const body = input.provider === 'claude-subscription' ? nativeSubscriptionBody(prompt) : {
       model: input.model, stream: true, tools: [], messages: [{ role: 'user', content: prompt }],
       metadata: { private: 'GUEST_CONTEXT_MUST_NOT_REACH_DEEPSEEK' } };
+    if (input.project) {
+      body.tools = structuredClone(projectToolDefinitions);
+      if (input.provider === 'claude-subscription') body.system[2].text = PROJECT_SYSTEM_PROMPT;
+      else body.system = PROJECT_SYSTEM_PROMPT;
+      body.messages = [{ role: 'user', content: prompt }];
+      for (let prior = 0; prior < index && prior < (options.projectTools?.length ?? 0); prior++) {
+        body.messages.push({ role: 'assistant', content: [{ type: 'text', text: responseTexts[prior] },
+          projectUse(options.projectTools[prior], prior)] });
+        body.messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: `tool_${prior}`,
+          content: `synthetic result ${prior}` }] });
+      }
+    }
+    if (input.identity && !options.ignoreIdentity) {
+      headers['x-claude-code-session-id'] = input.identity.session_id.toLowerCase();
+      body.metadata.user_id = JSON.stringify({ ...input.identity, session_id: input.identity.session_id.toLowerCase(), account_uuid: '' });
+    }
     if (options.badPrompt) body.messages[0].content = 'REPLACED_PROMPT';
-    const request = { kind: 'provider_request', id: requestID.replace(/2$/, String(index + 2)), headers, body };
+    const request = { kind: 'provider_request', id: requestID.slice(0, -12) + String(index + 2).padStart(12, '0'), headers, body };
     send(options.requestChange ? options.requestChange(request, index) : request);
   };
   const finish = () => {
@@ -64,8 +107,11 @@ function fixture(input = deepseek, options = {}) {
       if (frame.kind === 'start') {
         if (options.stall) continue;
         prompt = frame.prompt;
-        send({ kind: 'native_init', model: input.provider === 'claude-subscription' ? 'claude-sonnet-5-5' : input.model,
-          session_id: SUBSCRIPTION_SESSION_ID, no_tools: options.tools ? false : true });
+        const init = { kind: 'native_init', model: input.provider === 'claude-subscription' ? 'claude-sonnet-5-5' : input.model,
+          session_id: input.identity && !options.ignoreIdentity ? input.identity.session_id.toLowerCase() : SUBSCRIPTION_SESSION_ID,
+          no_tools: options.tools ? false : !input.project,
+          ...(input.project ? { tools: [...PROJECT_TOOLS], project_mount: PROJECT_MOUNT } : {}) };
+        send(options.initChange ? options.initChange(init) : init);
         if (options.guestError) {
           send({ kind: 'result', ok: false, error_code: options.guestError });
           continue;
@@ -76,6 +122,13 @@ function fixture(input = deepseek, options = {}) {
         // The final guest result mirrors the accumulated provider text.
         setImmediate(() => {
           if (ended) return;
+          if (requestIndex <= (options.projectTools?.length ?? 0)) {
+            const tool = options.projectTools[requestIndex - 1];
+            for (const phase of ['started', 'completed']) {
+              const activity = { kind: 'tool_activity', tool_id: `tool_${requestIndex - 1}`, tool, phase };
+              send(options.activityChange ? options.activityChange(activity) : activity);
+            }
+          }
           if (requestIndex < (options.requests ?? 1)) sendRequest();
           else send({ kind: 'result', ok: true,
             text: options.badResult ? 'FORGED_RESULT' : responseTexts.join('') });
@@ -88,7 +141,9 @@ function fixture(input = deepseek, options = {}) {
     launch: async () => {
       lifecycle.launches++;
       setImmediate(() => {
-        send({ kind: 'vm_config', network_devices: options.nic ? 1 : 0, directory_shares: 0, socket_devices: 1 });
+        const config = { ...(input.project ? projectVMConfiguration :
+          { kind: 'vm_config', directory_shares: 0, socket_devices: 1 }), network_devices: options.nic ? 1 : 0 };
+        send(options.configChange ? options.configChange(config) : config);
         if (options.malformedGuest) child.stdout.write('{"kind":"ready"\n');
         else send({ kind: 'ready' });
       }); return child;
@@ -96,7 +151,8 @@ function fixture(input = deepseek, options = {}) {
       outbound.push(parameters);
       const index = outbound.length - 1;
       return options.providerChange ? options.providerChange(parameters, index) : {
-        ...subscriptionSSE(responseTexts[index]), statusCode: options.httpStatus ?? 200 };
+        ...(input.project ? projectSSE(responseTexts[index], options.projectTools?.[index] ? projectUse(options.projectTools[index], index) : undefined) :
+          subscriptionSSE(responseTexts[index])), statusCode: options.httpStatus ?? 200 };
     }, ...(options.signal ? { signal: options.signal } : {}),
     ...(options.emitTrace === undefined ? {} : { emitTrace: options.emitTrace }),
     ...(options.stopDrainTimeoutMs ? { stopDrainTimeoutMs: options.stopDrainTimeoutMs } : {}) };
@@ -105,6 +161,121 @@ function fixture(input = deepseek, options = {}) {
 }
 
 const traceEvents = f => f.events.filter(event => event.type === 'request_trace');
+
+test('project input rejects ambiguous directory syntax without touching paths or starting a VM', async () => {
+  for (const project of [null, {}, { directory: '/' }, { directory: 'relative' }, { directory: '/tmp/../project' },
+    { directory: '/tmp/unsafe\0path' }, { directory: '/tmp/project', mode: 'rw' }]) {
+    const f = fixture({ ...deepseek, project });
+    assert.equal((await f.run()).code, 'INVALID_PROJECT_DIRECTORY');
+    assert.equal(f.lifecycle.launches, 0);
+  }
+  assert.deepEqual(validateInput({ ...deepseek, project: { directory: '/synthetic/not-accessed' } }).project,
+    { directory: '/synthetic/not-accessed' });
+});
+
+test('legacy native host entrypoint cannot enable project tools', async () => {
+  const never = () => { assert.fail('project request must not initialize host-native dependencies'); };
+  const terminal = await runDeepSeekTextChat({ ...deepseek, project: { directory: '/synthetic/not-accessed' } }, () => {},
+    { testOnly: true, query: never, spawn: never, transport: never, cliPath: '/synthetic/not-executed', cliSha256: 'd'.repeat(64) });
+  assert.equal(terminal.code, 'VM_PROJECT_REQUIRED');
+});
+
+for (const input of [deepseek, SUBSCRIPTION_INPUT]) test(`${input.provider} project preserves full tool chains and all assistant text`, async () => {
+  const projectInput = { ...input, project: { directory: '/synthetic/host-private-project' } };
+  const responseTexts = ['Inspecting. ', 'Editing. ', 'Writing. ', 'Running. ', 'Finished.'];
+  const f = fixture(projectInput, { requests: 5, projectTools: ['Read', 'Edit', 'Write', 'Bash'], responseTexts });
+  const terminal = await f.run();
+  assert.equal(terminal.type, 'completed', terminal.code);
+  assert.equal(terminal.no_tools, false); assert.equal(terminal.request_count, 5);
+  assert.equal(terminal.text, responseTexts.join(''));
+  const start = f.received.find(frame => frame.kind === 'start');
+  assert.deepEqual(start.project, { contract: PROJECT_EXECUTION_CONTRACT });
+  assert.equal(JSON.stringify(f.received).includes(projectInput.project.directory), false);
+  assert.equal(f.events.find(event => event.type === 'started').no_tools, false);
+  const activities = f.events.filter(event => event.type === 'tool_activity');
+  assert.equal(activities.length, 8);
+  assert.deepEqual(activities.map(({ tool, phase }) => [tool, phase]),
+    ['Read', 'Edit', 'Write', 'Bash'].flatMap(tool => [[tool, 'started'], [tool, 'completed']]));
+  assert.ok(activities.every(event => Object.keys(event).every(key =>
+    ['schema', 'request_id', 'model', 'fixture_only', 'type', 'tool_id', 'tool', 'phase'].includes(key))));
+  const finalBody = f.outbound.at(-1).body;
+  assert.deepEqual(finalBody.messages.slice(0, input.messages.length - 1),
+    input.messages.slice(0, -1).map(({ role, text }) => ({ role, content: text })));
+  assert.deepEqual(finalBody.messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
+    .filter(block => block.type === 'tool_result').map(block => block.content),
+    ['synthetic result 0', 'synthetic result 1', 'synthetic result 2', 'synthetic result 3']);
+  assert.equal(JSON.stringify(finalBody).includes(projectInput.project.directory), false);
+  assert.deepEqual([...new Set(traceEvents(f).map(event => event.trace.attempt))], [1, 2, 3, 4, 5]);
+});
+
+for (const [name, change] of [
+  ['missing share', value => ({ ...value, directory_shares: 0 })],
+  ['extra share', value => ({ ...value, directory_shares: 2 })],
+  ['read-only share', value => ({ ...value, project_read_only: true })],
+  ['wrong mount', value => ({ ...value, project_mount: '/other' })],
+  ['NIC', value => ({ ...value, network_devices: 1 })],
+  ['mismatched host share count', value => ({ ...value, host_directory_shares: 2 })],
+  ['clipboard device', value => ({ ...value, clipboard_devices: 1 })],
+  ['graphics device', value => ({ ...value, graphics_devices: 1 })],
+  ['non-disposable disk', value => ({ ...value, disposable_disk: false })],
+  ['wrong vsock port', value => ({ ...value, vsock_port: 0 })],
+  ['invalid CPU count', value => ({ ...value, cpu_count: 0 })],
+  ['invalid memory size', value => ({ ...value, memory_bytes: 0 })],
+  ['missing host share receipt', value => { const changed = { ...value }; delete changed.host_directory_shares; return changed; }],
+  ['unknown configuration field', value => ({ ...value, extra_share: '/not-allowed' })],
+]) test(`project ${name} fails isolation before model request`, async () => {
+  const f = fixture({ ...deepseek, project: { directory: '/synthetic/project' } }, { configChange: change });
+  assert.equal((await f.run()).code, 'VM_ISOLATION_REJECTED');
+  assert.equal(f.outbound.length, 0);
+});
+
+test('project VM accepts the complete native helper configuration receipt', async () => {
+  const f = fixture({ ...deepseek, project: { directory: '/synthetic/project' } }, {
+    configChange(config) { assert.deepEqual(config, projectVMConfiguration); return config; },
+  });
+  assert.equal((await f.run()).type, 'completed');
+  assert.equal(f.outbound.length, 1);
+});
+
+for (const [name, change] of [
+  ['unknown id', value => ({ ...value, tool_id: 'unknown' })],
+  ['wrong name', value => ({ ...value, tool: 'Bash' })],
+  ['completion before start', value => ({ ...value, phase: 'completed' })],
+  ['raw command field', value => ({ ...value, command: 'private' })],
+]) test(`project activity ${name} is rejected`, async () => {
+  const f = fixture({ ...deepseek, project: { directory: '/synthetic/project' } },
+    { requests: 2, projectTools: ['Read'], activityChange: change });
+  assert.equal((await f.run()).code, 'PROJECT_TOOL_PROTOCOL_REJECTED');
+  assert.equal(f.events.some(event => event.type === 'completed'), false);
+});
+
+test('project permits at most 24 traced provider requests while text remains limited to three', async () => {
+  const input = { ...deepseek, project: { directory: '/synthetic/project' } };
+  const accepted = fixture(input, { requests: 24 });
+  assert.equal((await accepted.run()).type, 'completed');
+  assert.equal(traceEvents(accepted).at(-1).trace.attempt, 24);
+  const rejected = fixture(input, { requests: 25 });
+  assert.equal((await rejected.run()).code, 'VM_REQUEST_REJECTED');
+  assert.equal(rejected.outbound.length, 24);
+});
+
+test('the production directory boundary accepts a temporary directory and rejects aliases, files and App storage ancestors', async () => {
+  const base = await realpath(await mkdtemp(path.join(os.tmpdir(), 'project-directory-test-')));
+  try {
+    const directory = path.join(base, 'project'); await mkdir(directory);
+    const admitted = await validateProjectDirectory({ directory });
+    assert.equal(admitted.directory, directory);
+    assert.match(admitted.dev, /^\d+$/); assert.match(admitted.ino, /^\d+$/);
+    const alias = path.join(base, 'alias'); await symlink(directory, alias);
+    await assert.rejects(validateProjectDirectory({ directory: alias }), { code: 'PROJECT_DIRECTORY_CHANGED' });
+    const file = path.join(base, 'file'); await writeFile(file, 'synthetic');
+    await assert.rejects(validateProjectDirectory({ directory: file }), { code: 'PROJECT_DIRECTORY_UNAVAILABLE' });
+    await assert.rejects(validateProjectDirectory({ directory: await realpath(os.homedir()) }), { code: 'PROJECT_DIRECTORY_FORBIDDEN' });
+    await assert.rejects(validateProjectDirectory({ directory: path.join(await realpath(os.homedir()), 'Library') }),
+      { code: 'PROJECT_DIRECTORY_FORBIDDEN' });
+  } finally { await rm(base, { recursive: true, force: true }); }
+});
+
 function assertTraceShape(event, input) {
   assert.equal(event.schema, 'deepseek-text-chat-event/v1');
   assert.equal(event.request_id, input.request_id);
@@ -176,6 +347,48 @@ test('subscription token stays host and bounded identity passes existing protoco
   assert.equal(f.outbound[0].subscriptionToken, SUBSCRIPTION_INPUT.subscriptionToken);
   assert.equal('x-untrusted-header' in f.outbound[0].headers, false);
   assert.equal(JSON.stringify(f.outbound[0].body).includes('/private/temporary'), false);
+});
+test('App identity reaches guest before native launch and remains unchanged in native headers and metadata', async () => {
+  const input = { ...SUBSCRIPTION_INPUT, identity: IDENTITY };
+  for (const sessionID of [IDENTITY.session_id, 'B6EAA231-7A86-4789-A67D-84C3F1A7968E']) {
+    const f = fixture({ ...input, identity: { ...IDENTITY, session_id: sessionID } });
+    const terminal = await f.run();
+    assert.equal(terminal.type, 'completed');
+    const identity = { ...IDENTITY, session_id: sessionID.toLowerCase() };
+    assert.deepEqual(f.received.find(frame => frame.kind === 'start').identity, identity);
+    assert.equal(JSON.stringify(f.received).includes(input.subscriptionToken), false);
+    assert.deepEqual(JSON.parse(f.outbound[0].body.metadata.user_id), { ...identity, account_uuid: '' });
+    assert.equal(f.outbound[0].headers['x-claude-code-session-id'], identity.session_id);
+  }
+});
+test('ignored native identity and substituted device identity fail before transport or trace', async () => {
+  for (const options of [
+    { ignoreIdentity: true },
+    { requestChange: request => ({ ...request, body: { ...request.body,
+      metadata: { user_id: JSON.stringify({ ...IDENTITY, device_id: '8'.repeat(64), account_uuid: '' }) } } }) },
+    { requestChange: request => ({ ...request, body: { ...request.body,
+      metadata: { user_id: JSON.stringify({ ...IDENTITY, account_uuid: SUBSCRIPTION_SESSION_ID }) } } }) },
+  ]) {
+    const f = fixture({ ...SUBSCRIPTION_INPUT, identity: IDENTITY }, options);
+    const terminal = await f.run();
+    assert.equal(terminal.code, 'NATIVE_IDENTITY_MISMATCH');
+    assert.equal(f.outbound.length, 0); assert.equal(traceEvents(f).length, 0);
+  }
+});
+test('invalid identity cannot launch VM and DeepSeek cannot receive subscription identity', async () => {
+  for (const identity of [null, {}, { ...IDENTITY, device_id: 'a'.repeat(63) }, { ...IDENTITY, device_id: 'A'.repeat(64) },
+    { ...IDENTITY, session_id: 'not-a-uuid' }, { ...IDENTITY, token: 'synthetic' }]) {
+    const f = fixture({ ...SUBSCRIPTION_INPUT, identity });
+    assert.equal((await f.run()).code, 'INVALID_IDENTITY'); assert.equal(f.lifecycle.launches, 0);
+  }
+  const f = fixture({ ...deepseek, identity: IDENTITY });
+  assert.equal((await f.run()).code, 'INVALID_IDENTITY'); assert.equal(f.lifecycle.launches, 0);
+});
+test('legacy host-native entrypoint refuses identity instead of silently using temporary native identity', async () => {
+  const never = () => { assert.fail('legacy identity request must not initialize native dependencies'); };
+  const terminal = await runDeepSeekTextChat({ ...SUBSCRIPTION_INPUT, identity: IDENTITY }, () => {},
+    { testOnly: true, query: never, spawn: never, transport: never, cliPath: '/fixture/not-executed', cliSha256: 'd'.repeat(64) });
+  assert.equal(terminal.code, 'VM_IDENTITY_UNSUPPORTED');
 });
 for (const [name, options, code] of [
   ['NIC configured', { nic: true }, 'VM_ISOLATION_REJECTED'],
@@ -498,5 +711,56 @@ test('an injected active runtime uses its admission helper and fails without fal
     assert.equal(terminal.type, 'error'); assert.equal(terminal.code, 'ACTIVE_RUNTIME_BODY_REJECTED');
     assert.equal(f.lifecycle.launches, 1); assert.equal(f.outbound.length, 0);
     assert.equal(traceEvents(f).length, 0); assert.equal(f.lifecycle.closed, true);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+for (const capability of [undefined, 'different-identity-contract']) {
+  test(`an active runtime with ${capability ?? 'no identity capability'} refuses stable identity before VM launch`, async () => {
+    const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'vm-chat-identity-compatibility-')));
+    try {
+      await mkdir(path.join(directory, 'sdk'));
+      await writeFile(path.join(directory, 'sdk/deepseek-text-chat.mjs'), [
+        ...(capability === undefined ? [] : [`export const TEXT_IDENTITY_CONTRACT = ${JSON.stringify(capability)};`]),
+        'export function providerBody(body) { return body; }',
+        'export function subscriptionHeaders(headers) { return headers; }',
+      ].join('\n'));
+      const f = fixture({ ...SUBSCRIPTION_INPUT, identity: IDENTITY }, { runtimeRoot: directory });
+      assert.equal((await f.run()).code, 'VM_IDENTITY_UNSUPPORTED');
+      assert.equal(f.lifecycle.launches, 0); assert.equal(f.outbound.length, 0); assert.equal(traceEvents(f).length, 0);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+}
+
+for (const capability of [undefined, 'different-project-contract']) {
+  test(`an active runtime with ${capability ?? 'no project capability'} refuses a project before VM launch`, async () => {
+    const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'vm-chat-project-compatibility-')));
+    try {
+      await mkdir(path.join(directory, 'sdk'));
+      await writeFile(path.join(directory, 'sdk/deepseek-text-chat.mjs'), [
+        ...(capability === undefined ? [] : [`export const PROJECT_EXECUTION_CONTRACT = ${JSON.stringify(capability)};`]),
+        'export function providerBody(body) { return body; }',
+        'export function subscriptionHeaders(headers) { return headers; }',
+      ].join('\n'));
+      const f = fixture({ ...deepseek, project: { directory: '/synthetic/not-accessed' } }, { runtimeRoot: directory });
+      assert.equal((await f.run()).code, 'VM_PROJECT_UNSUPPORTED');
+      assert.equal(f.lifecycle.launches, 0); assert.equal(f.outbound.length, 0); assert.equal(traceEvents(f).length, 0);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+}
+
+test('App broker independently rejects identity replaced by an active runtime admission helper', async () => {
+  const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'vm-chat-identity-admission-')));
+  try {
+    await mkdir(path.join(directory, 'sdk'));
+    await writeFile(path.join(directory, 'sdk/deepseek-text-chat.mjs'), [
+      `export const TEXT_IDENTITY_CONTRACT = ${JSON.stringify(TEXT_IDENTITY_CONTRACT)};`,
+      'export function providerBody(body) { return { ...body, metadata: { user_id: JSON.stringify({',
+      `  device_id: '${'9'.repeat(64)}', session_id: '${IDENTITY.session_id}', account_uuid: ''`,
+      '}) } }; }',
+      'export function subscriptionHeaders(headers) { return headers; }',
+    ].join('\n'));
+    const f = fixture({ ...SUBSCRIPTION_INPUT, identity: IDENTITY }, { runtimeRoot: directory });
+    assert.equal((await f.run()).code, 'NATIVE_IDENTITY_MISMATCH');
+    assert.equal(f.lifecycle.launches, 1); assert.equal(f.outbound.length, 0); assert.equal(traceEvents(f).length, 0);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

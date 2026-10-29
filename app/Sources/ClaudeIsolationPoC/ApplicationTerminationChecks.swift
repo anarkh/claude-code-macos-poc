@@ -194,9 +194,11 @@ func applicationTerminationChecks() async -> [(String, Bool)] {
         process.executableURL = URL(fileURLWithPath: "/bin/sleep"); process.arguments = ["30"]
         process.environment = ["PATH": "/usr/bin:/bin"]
         try controller.registerWork(in: fixture.registry)
+        // Observe real exit directly. Launching on MainActor and waiting from
+        // another thread can delay Foundation's waiter beyond the fixture's deadline.
+        process.terminationHandler = { _ in controller.finish() }
         do { try controller.install(process); try process.run(); controller.didStart() }
         catch { controller.finish(); throw error }
-        DispatchQueue.global().async { process.waitUntilExit(); controller.finish() }
         let coordinator = fixture.coordinator()
         let first = Task { try await coordinator.requestTermination() }
         let duplicate = Task { try await coordinator.requestTermination() }

@@ -93,13 +93,13 @@ func networkBridgeChecks(configuration: AppConfiguration) async -> [(String, Boo
         messages: [.init(role: "user", text: "Reply only LOCAL_OFFLINE_PROBE.")],
         provider: .claudeSubscription, subscriptionToken: "sk-ant-oat01-offline-network-fixture")
     do {
-        for try await _ in StdioChatProvider(configuration: brokerConfiguration, networkPolicyProvider: policies, runtimeProfileProvider: FixedRuntimeProfileProvider()).events(for: subscriptionRequest) {}
+        for try await _ in StdioChatProvider(configuration: brokerConfiguration, networkPolicyProvider: policies, runtimeProfileProvider: FixedRuntimeProfileProvider(), installationIdentityStore: FixtureInstallationIdentityStore()).events(for: subscriptionRequest) {}
         checks.append(("network_subscription_offline_broker_stdio_proxy_error_is_forwarded", false))
     } catch let failure as ChatFailure {
         if case .code(let code) = failure { checks.append(("network_subscription_offline_broker_stdio_proxy_error_is_forwarded", code == "PROXY_CONNECT_FAILED")) }
     } catch { checks.append(("network_subscription_offline_broker_stdio_proxy_error_is_forwarded", false)) }
     do {
-        _ = try await StdioExecutionConnectionTester(configuration: brokerConfiguration, networkPolicyProvider: policies, runtimeProfileProvider: FixedRuntimeProfileProvider()).testSubscription(token: "sk-ant-oat01-offline-network-fixture", model: "sonnet")
+        _ = try await StdioExecutionConnectionTester(configuration: brokerConfiguration, networkPolicyProvider: policies, runtimeProfileProvider: FixedRuntimeProfileProvider(), installationIdentityStore: FixtureInstallationIdentityStore()).testSubscription(token: "sk-ant-oat01-offline-network-fixture", model: "sonnet")
         checks.append(("network_subscription_connection_offline_broker_stdio_proxy_error_is_forwarded", false))
     } catch let failure as ExecutionConnectionFailure { checks.append(("network_subscription_connection_offline_broker_stdio_proxy_error_is_forwarded", failure.code == "PROXY_CONNECT_FAILED")) }
     catch { checks.append(("network_subscription_connection_offline_broker_stdio_proxy_error_is_forwarded", false)) }

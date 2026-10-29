@@ -131,7 +131,7 @@ def main():
         if not atomic.is_file():raise RuntimeError('verified official libatomic package is not ready')
         shutil.copyfile(atomic,seed/'atomic.deb')
         # Only public runtime/code files enter the payload, never Mac runs/HOME/config.
-        entrypoints=['package.json','run-isolated.sh','run-poc.mjs'] if args.mode=='combined' else ['package.json','origin-contract.mjs','run-native-admission.mjs','run-native-isolated.sh']
+        entrypoints=['package.json','run-isolated.sh','run-poc.mjs','poc-host-privacy.mjs'] if args.mode=='combined' else ['package.json','origin-contract.mjs','run-native-admission.mjs','run-native-isolated.sh']
         with tarfile.open(seed/'sdk.tgz','w:gz') as archive:
             for name in entrypoints+['node_modules/@anthropic-ai/claude-agent-sdk','node_modules/@anthropic-ai/claude-agent-sdk-linux-arm64']:
                 archive.add(sdk/name,arcname=name)

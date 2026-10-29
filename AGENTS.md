@@ -11,9 +11,9 @@
 
 ## 保持现有隔离契约
 
-- 正常运行的文本 VM 和浏览器 VM 均无网卡、无宿主目录共享；浏览器镜像准备阶段的 NAT 仅用于下载公共依赖，不能带入正式运行配置。
+- 正常运行的 VM 均无网卡。纯文本会话和浏览器 VM 无宿主目录共享；用户在会话中显式选择项目目录时，项目 VM 仅以读写方式共享该目录到固定 guest 路径，不共享整个主目录或 App 私有数据。浏览器镜像准备阶段的 NAT 仅用于下载公共依赖，不能带入正式运行配置。
 - 模型和浏览器流量通过宿主 broker/代理及 vsock 传输。保留显式 HTTP CONNECT 代理、目标证书校验和错误路径；代理失败时不得静默直连，也不能关闭 TLS 校验来让测试通过。
-- 文本运行时使用空工具集，关闭项目文件、Shell、MCP 和 agent/plugin 执行。文本 Skills 不代表工具授权；新增这些能力属于功能与权限范围变化，须有用户明确授权。
+- 未选择项目目录的文本运行时使用空工具集；项目模式仅启用 Read、Write、Edit、Bash、Glob、Grep，命令在 Linux VM 内执行。MCP、agent/plugin 和项目设置中的自动 hooks 仍关闭。文本 Skills 不代表工具授权；增加其他共享目录、工具或网络能力属于功能与权限范围变化，须有用户明确授权。
 - 模型真实凭据留在宿主，guest 只使用受控的占位凭据。不得把真实 Key/Token 放进 VM seed、镜像、协议转储或日志。
 - 浏览器粘贴由用户显式触发，每次只传纯文本；不得改成后台读取剪贴板、持续同步或隐式文件共享。
 - 浏览器资料盘是持久用户数据，根盘克隆是可清理的临时产物。资料盘租约必须保持到 VM 完全停止；停止、重启、退出及失败清理不能提前释放锁或删除仍在使用的磁盘。
@@ -37,6 +37,7 @@
 | 翻译协议和内容保护 | `node --test translation/test-*.mjs` |
 | 运行包下载、校验和更新 | `node --test updates/test-*.mjs`，需要系统 Python；使用本地假服务/helper |
 | 文本桥、请求追踪与 guest 文本契约 | 下方明确列出的 Node 测试 |
+| 项目目录挂载、工具执行与多轮消息 | 文本路径检查，加 `node --test sdk/test-project-provider-protocol.mjs sdk/test-project-relay.mjs`、`python3 -m unittest discover -s host/text-runtime -p 'test_project_launch.py'`；真实 VM 使用合成临时项目验证读写、命令、取消与目录边界 |
 | Swift UI、配置、存储、生命周期 | Swift 编译与 App 内置 `--self-test`；本项目不以 `swift test` 作为 App 自检入口 |
 
 文本路径的离线检查使用显式文件名：
