@@ -409,29 +409,31 @@ func conversationViewModelChecks() async -> [(String, Bool)] {
         let launched = await conversationCheckWait { !chat.requests().isEmpty }
         if launched, let request = chat.requests().first, let runID = UUID(uuidString: request.request_id) {
             let requestTrace = requestTraceFixture(runID: runID)
+            let persistedRequest = requestTrace.persisted(captureBody: false, capturedAt: Date(timeIntervalSince1970: 0))
             chat.emit(.requestTrace(requestTrace))
             let recorded = await conversationCheckWait { harness.vm.messages.last(where: { $0.role == .assistant })?.requestTraces?.count == 1 }
             if let record = harness.vm.selectedConversation, let user = record.messages.first(where: { $0.role == .user }),
                let assistant = record.messages.first(where: { $0.role == .assistant }) {
-                check("user and assistant share the same live attempt", recorded && user.runID == runID && assistant.runID == runID && user.requestTraces == nil && harness.vm.requestTraces(for: user, in: record) == [requestTrace] && harness.vm.requestTraces(for: assistant, in: record) == [requestTrace])
+                check("user and assistant share the same live attempt", recorded && user.runID == runID && assistant.runID == runID && user.requestTraces == nil && harness.vm.requestTraces(for: user, in: record) == [persistedRequest] && harness.vm.requestTraces(for: assistant, in: record) == [persistedRequest])
                 check("user request sheet follows assistant execution state", harness.vm.requestDetailsMessage(for: user, in: record).id == assistant.id && harness.vm.requestDetailsMessage(for: user, in: record).state == .running)
             } else { check("user and assistant share the same live attempt", false) }
             let response = requestTraceFixture(runID: runID, phase: .response)
+            let persistedResponse = response.persisted(captureBody: false, capturedAt: Date(timeIntervalSince1970: 0))
             chat.emit(.requestTrace(response)); chat.emit(.delta(ConversationCheckChat.rawReply)); chat.emit(.completed(ConversationCheckChat.rawReply)); chat.finish()
             let finished = await conversationCheckWait { !harness.vm.isBusy }
             if let record = harness.vm.selectedConversation, let assistant = record.messages.first(where: { $0.role == .assistant }),
                let user = record.messages.first(where: { $0.role == .user }) {
-                check("terminal trace replaces its attempt without duplicating full body", finished && assistant.requestTraces == [response] && harness.vm.requestTraces(for: user, in: record) == [response])
+                check("terminal trace replaces its attempt while retaining only its summary", finished && assistant.requestTraces == [persistedResponse] && harness.vm.requestTraces(for: user, in: record) == [persistedResponse])
                 harness.vm.translateMessage(assistant.id)
                 _ = await conversationCheckWait { !harness.vm.translatingMessageIDs.contains(assistant.id) }
                 let translated = harness.vm.messages.first { $0.id == assistant.id }
-                check("output translation leaves the CLI trace unchanged", translated?.translation != nil && translated?.requestTraces == [response] && chat.requests().count == 1)
+                check("output translation leaves the CLI trace unchanged", translated?.translation != nil && translated?.requestTraces == [persistedResponse] && chat.requests().count == 1)
                 let restored = ConversationCheckHarness(defaults: defaults, store: harness.store)
                 if let saved = restored.vm.selectedConversation, let savedUser = saved.messages.first(where: { $0.role == .user }) {
-                    check("restart preserves trace lookup for both messages", restored.vm.requestTraces(for: savedUser, in: saved) == [response] && restored.chat.requests().isEmpty)
+                    check("restart preserves trace lookup for both messages", restored.vm.requestTraces(for: savedUser, in: saved) == [persistedResponse] && restored.chat.requests().isEmpty)
                 } else { check("restart preserves trace lookup for both messages", false) }
                 restored.vm.shutdown()
-            } else { check("terminal trace replaces its attempt without duplicating full body", false) }
+            } else { check("terminal trace replaces its attempt while retaining only its summary", false) }
         } else { check("trace test obtains a CLI run", false) }
         harness.vm.shutdown()
     }
@@ -444,12 +446,13 @@ func conversationViewModelChecks() async -> [(String, Bool)] {
         if let request = chat.requests().first, let runID = UUID(uuidString: request.request_id) {
             let requestTrace = requestTraceFixture(runID: runID)
             let failedTrace = requestTraceFixture(runID: runID, phase: .error)
+            let persistedFailure = failedTrace.persisted(captureBody: false, capturedAt: Date(timeIntervalSince1970: 0))
             chat.emit(.requestTrace(requestTrace)); chat.emit(.requestTrace(failedTrace)); chat.fail(.code("PROVIDER_CONNECTION_FAILED"))
             let finished = await conversationCheckWait { !harness.vm.isBusy }
             let assistant = harness.vm.messages.first { $0.role == .assistant }
-            check("failed reply retains full actual request and transport outcome", finished && assistant?.state == .failed && assistant?.requestTraces == [failedTrace] && harness.vm.draft == "请求失败时保存")
+            check("failed reply retains request summary and transport outcome", finished && assistant?.state == .failed && assistant?.requestTraces == [persistedFailure] && harness.vm.draft == "请求失败时保存")
             let restored = ConversationCheckHarness(defaults: defaults, store: harness.store)
-            check("failed trace is readable after restart without replay", restored.vm.messages.first(where: { $0.role == .assistant })?.requestTraces == [failedTrace] && restored.chat.requests().isEmpty)
+            check("failed trace is readable after restart without replay", restored.vm.messages.first(where: { $0.role == .assistant })?.requestTraces == [persistedFailure] && restored.chat.requests().isEmpty)
             restored.vm.shutdown()
         } else { check("failed trace fixture run", false) }
         harness.vm.shutdown()
@@ -462,15 +465,16 @@ func conversationViewModelChecks() async -> [(String, Bool)] {
         _ = await conversationCheckWait { !chat.requests().isEmpty }
         if let request = chat.requests().first, let runID = UUID(uuidString: request.request_id) {
             let requestTrace = requestTraceFixture(runID: runID)
+            let persistedRequest = requestTrace.persisted(captureBody: false, capturedAt: Date(timeIntervalSince1970: 0))
             chat.emit(.requestTrace(requestTrace))
             _ = await conversationCheckWait { harness.vm.messages.first(where: { $0.role == .assistant })?.requestTraces?.count == 1 }
             let restored = ConversationCheckHarness(defaults: defaults, store: harness.store)
-            let cancelled = requestTrace.markingInterrupted()
+            let cancelled = persistedRequest.markingInterrupted()
             check("restart marks an unfinished request cancelled without inventing time", restored.vm.messages.first(where: { $0.role == .assistant })?.state == .cancelled && restored.vm.messages.first(where: { $0.role == .assistant })?.requestTraces == [cancelled] && restored.chat.requests().isEmpty)
             restored.vm.shutdown()
             harness.vm.stop(); chat.finish()
             let stopped = await conversationCheckWait { !harness.vm.isBusy }
-            check("stop keeps request body and cancellation on the same run", stopped && harness.vm.messages.first(where: { $0.role == .assistant })?.requestTraces == [cancelled] && harness.vm.draft == "停止后保留请求")
+            check("stop keeps request summary and cancellation on the same run", stopped && harness.vm.messages.first(where: { $0.role == .assistant })?.requestTraces == [cancelled] && harness.vm.draft == "停止后保留请求")
         } else { check("cancel trace fixture run", false) }
         harness.vm.shutdown()
     }
@@ -496,6 +500,8 @@ func conversationViewModelChecks() async -> [(String, Bool)] {
         check("input translation failure never creates a CLI request trace", finished && harness.chat.requests().isEmpty && harness.vm.messages.allSatisfy { $0.requestTraces == nil })
         harness.vm.shutdown()
     }
+    checks += await conversationProjectLifecycleChecks(defaults: defaults)
+    checks += await conversationPrivacyLifecycleChecks(defaults: defaults)
     return checks
 }
 
@@ -515,7 +521,8 @@ private struct ConversationCheckHarness {
          translator: ConversationCheckTranslator = .init(),
          chat: ConversationCheckChat = .init(),
          store: MemoryConversationStore = .init(),
-         persistence: (any ConversationPersisting)? = nil, skills: SkillsViewModel? = nil) {
+         persistence: (any ConversationPersisting)? = nil, skills: SkillsViewModel? = nil,
+         diagnostics: DiagnosticsSettingsModel? = nil, diagnosticNow: @escaping () -> Date = Date.init) {
         self.translator = translator; self.chat = chat; self.store = store
         translation = TranslationViewModel(provider: translator, configurationStore: .init(defaults: defaults), credentials: translationKey)
         translation.endpoint = "https://api.deepseek.com/chat/completions"
@@ -525,7 +532,8 @@ private struct ConversationCheckHarness {
         execution.modelName = "deepseek-flash[1m]"
         vm = ConversationViewModel(translation: translation, execution: execution, translator: translator,
                                    provider: chat, store: persistence ?? store,
-                                   translationCredentials: translationKey, executionCredentials: executionKey, subscriptionCredentials: subscriptionKey, skills: skills)
+                                   translationCredentials: translationKey, executionCredentials: executionKey, subscriptionCredentials: subscriptionKey, skills: skills,
+                                   diagnostics: diagnostics, diagnosticNow: diagnosticNow)
     }
 }
 
@@ -606,4 +614,369 @@ private func conversationCheckWaitAsync(_ predicate: () async -> Bool) async -> 
         do { try await Task.sleep(for: .milliseconds(2)) } catch { return false }
     }
     return await predicate()
+}
+
+@MainActor
+private func conversationPrivacyLifecycleChecks(defaults: UserDefaults) async -> [(String, Bool)] {
+    var checks: [(String, Bool)] = []
+    func check(_ name: String, _ passed: Bool) { checks.append(("conversation privacy: \(name)", passed)) }
+
+    do {
+        let harness = ConversationCheckHarness(defaults: defaults)
+        harness.execution.provider = .claudeSubscription
+        let firstID = harness.vm.selectedID
+        harness.vm.draft = "第一轮"; harness.vm.send()
+        let firstFinished = await conversationCheckWait { !harness.vm.isBusy }
+        harness.vm.draft = "第二轮"; harness.vm.send()
+        let secondFinished = await conversationCheckWait { !harness.vm.isBusy }
+        let firstRequests = harness.chat.requests()
+        check("subscription turns share their App conversation session and keep distinct request IDs", firstFinished && secondFinished && firstRequests.count == 2 && firstRequests.allSatisfy { $0.conversationSessionID == firstID } && Set(firstRequests.map(\.request_id)).count == 2)
+        harness.vm.newConversation()
+        let secondID = harness.vm.selectedID
+        harness.vm.draft = "另一段对话"; harness.vm.send()
+        let newFinished = await conversationCheckWait { !harness.vm.isBusy }
+        check("a new App conversation receives another session ID", newFinished && firstID != secondID && harness.chat.requests().last?.conversationSessionID == secondID)
+        harness.vm.shutdown()
+        let restored = ConversationCheckHarness(defaults: defaults, store: harness.store)
+        restored.execution.provider = .claudeSubscription
+        if let firstID { restored.vm.selectConversation(firstID) }
+        restored.vm.draft = "重启后继续原对话"; restored.vm.send()
+        let restoredFinished = await conversationCheckWait { !restored.vm.isBusy }
+        check("restoring an existing conversation retains its session ID", restoredFinished && restored.chat.requests().first?.conversationSessionID == firstID)
+        do {
+            let persisted = String(decoding: try JSONEncoder().encode(harness.store.snapshot), as: UTF8.self)
+            check("conversation identity persistence contains no OAuth token field or value", !persisted.contains("subscriptionToken") && !persisted.contains("sk-ant-oat01-conversation-offline-fixture"))
+        } catch { check("conversation identity persistence contains no OAuth token field or value", false) }
+        restored.vm.shutdown()
+    }
+
+    do {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("diagnostic-summary-check-\(UUID().uuidString)")
+        defer {
+            do { if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) } }
+            catch { check("summary fixture cleanup", false) }
+        }
+        let file = directory.appendingPathComponent("conversations.json")
+        let disk = FileConversationStore(fileURL: file)
+        let chat = ConversationCheckChat(automatic: false)
+        let harness = ConversationCheckHarness(defaults: defaults, chat: chat, persistence: disk)
+        harness.vm.draft = "默认仅保存摘要"; harness.vm.send()
+        _ = await conversationCheckWait { !chat.requests().isEmpty }
+        if let request = chat.requests().first, let runID = UUID(uuidString: request.request_id) {
+            let trace = conversationPrivacyTrace(runID: runID)
+            chat.emit(.requestTrace(trace))
+            chat.emit(.requestTrace(conversationPrivacyTrace(runID: runID, phase: .response)))
+            chat.emit(.completed("正常回复")); chat.finish()
+            let finished = await conversationCheckWait { !harness.vm.isBusy }
+            let saved = try disk.load()
+            let diagnostic = saved.conversations.flatMap(\.messages).flatMap { $0.requestTraces ?? [] }.first
+            let bytes = String(decoding: try Data(contentsOf: file), as: UTF8.self)
+            check("default summary persists transport outcome without body or identity header", finished && diagnostic?.schema == "claude-request-trace/v2" && diagnostic?.bodyAvailability == .notCaptured && diagnostic?.body.isEmpty == true && diagnostic?.bodyBytes == trace.bodyBytes && diagnostic?.status == 200 && diagnostic?.headers["x-claude-code-session-id"] == nil && !bytes.contains("diagnostic-only-content-marker") && !bytes.contains("fixture-device-identity") && !bytes.contains("x-claude-code-session-id"))
+            check("summary mode preserves ordinary user and assistant messages", saved.conversations.flatMap(\.messages).contains { $0.role == .user && $0.originalText == "默认仅保存摘要" } && saved.conversations.flatMap(\.messages).contains { $0.role == .assistant && $0.text == "正常回复" })
+        } else { check("summary fixture starts one request", false) }
+        harness.vm.shutdown()
+    } catch { check("summary disk readback fixture", false) }
+
+    do {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("diagnostic-retention-check-\(UUID().uuidString)")
+        defer {
+            do { if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) } }
+            catch { check("retention fixture cleanup", false) }
+        }
+        let file = directory.appendingPathComponent("conversations.json")
+        let disk = FileConversationStore(fileURL: file)
+        let clock = ConversationDiagnosticClock()
+        let capturedAt = clock.now
+        let diagnostics = DiagnosticsSettingsModel()
+        diagnostics.setCaptureBodies(true)
+        let chat = ConversationCheckChat(automatic: false)
+        let harness = ConversationCheckHarness(defaults: defaults, chat: chat, persistence: disk, diagnostics: diagnostics, diagnosticNow: { clock.now })
+        harness.vm.draft = "明确开启正文采集"; harness.vm.send()
+        _ = await conversationCheckWait { !chat.requests().isEmpty }
+        if let request = chat.requests().first, let runID = UUID(uuidString: request.request_id) {
+            let trace = conversationPrivacyTrace(runID: runID)
+            chat.emit(.requestTrace(trace))
+            _ = await conversationCheckWait { harness.vm.messages.last(where: { $0.role == .assistant })?.requestTraces?.first?.hasBody == true }
+            clock.now = capturedAt.addingTimeInterval(120)
+            chat.emit(.requestTrace(conversationPrivacyTrace(runID: runID, phase: .response)))
+            chat.emit(.completed("正文生命周期不影响这段回复")); chat.finish()
+            let finished = await conversationCheckWait { !harness.vm.isBusy }
+            let captured = try disk.load().conversations.flatMap(\.messages).flatMap { $0.requestTraces ?? [] }.first
+            check("explicit capture retains one body for 24 hours from the request event", finished && captured?.bodyAvailability == .available && captured?.body == trace.body && captured?.capturedAt == capturedAt && captured?.expiresAt == capturedAt.addingTimeInterval(86_400) && captured?.phase == .response)
+            harness.vm.shutdown()
+            var snapshot = try disk.load()
+            let legacyRun = UUID()
+            let legacyTrace = requestTraceFixture(runID: legacyRun, phase: .response, body: "{\"model\":\"deepseek-flash[1m]\",\"messages\":[{\"content\":\"legacy-private-body-marker\"}]}")
+            let legacy = ConversationRecord(title: "历史 v1", messages: [
+                .init(role: .user, text: "历史输入", runID: legacyRun),
+                .init(role: .assistant, text: "历史回复", runID: legacyRun, requestTraces: [legacyTrace])
+            ])
+            snapshot.conversations.append(legacy)
+            try disk.save(snapshot)
+            let overdueStore = MemoryConversationStore(snapshot)
+            let overdue = ConversationCheckHarness(defaults: defaults, store: overdueStore, diagnosticNow: { capturedAt.addingTimeInterval(86_401) })
+            let overdueTrace = overdueStore.snapshot.conversations.flatMap(\.messages).flatMap { $0.requestTraces ?? [] }.first { $0.attemptID == trace.attemptID }
+            check("startup prunes bodies whose retention elapsed while the App was closed", overdueTrace?.bodyAvailability == .expired && overdueTrace?.body.isEmpty == true && overdueStore.snapshot.conversations.first { $0.id == legacy.id } == legacy && overdue.chat.requests().isEmpty && overdue.translationKey.loads == 0 && overdue.executionKey.loads == 0)
+            overdue.vm.shutdown()
+            let restored = ConversationCheckHarness(defaults: defaults, persistence: disk, diagnosticNow: { clock.now })
+            let restoredTrace = restored.vm.conversations.flatMap(\.messages).flatMap { $0.requestTraces ?? [] }.first { $0.attemptID == trace.attemptID }
+            check("restart preserves unexpired consented body even when future capture is off", restoredTrace == captured && restored.chat.requests().isEmpty && restored.translationKey.loads == 0 && restored.executionKey.loads == 0)
+            let contentBeforeExpiry = conversationRecordsWithoutTraces(restored.vm.conversations)
+            clock.now = capturedAt.addingTimeInterval(86_400)
+            restored.vm.expireRequestBodies()
+            let expiredSnapshot = try disk.load()
+            let expired = expiredSnapshot.conversations.flatMap(\.messages).flatMap { $0.requestTraces ?? [] }.first { $0.attemptID == trace.attemptID }
+            let expiredBytes = String(decoding: try Data(contentsOf: file), as: UTF8.self)
+            check("24-hour boundary removes the new body from memory and disk", expired?.bodyAvailability == .expired && expired?.body.isEmpty == true && expired?.bodyBytes == trace.bodyBytes && expired?.status == 200 && !expiredBytes.contains("diagnostic-only-content-marker") && restored.vm.messages.last(where: { $0.role == .assistant })?.requestTraces?.first == expired)
+            check("automatic expiry preserves all conversation content and legacy v1 bodies", conversationRecordsWithoutTraces(expiredSnapshot.conversations) == contentBeforeExpiry && expiredSnapshot.conversations.first { $0.id == legacy.id } == legacy && expiredBytes.contains("legacy-private-body-marker"))
+            restored.vm.clearRequestBodies(conversationID: legacy.id)
+            let clearedSnapshot = try disk.load()
+            let clearedLegacy = clearedSnapshot.conversations.first { $0.id == legacy.id }?.messages.last?.requestTraces?.first
+            let clearedBytes = String(decoding: try Data(contentsOf: file), as: UTF8.self)
+            check("manual cleanup removes legacy body while retaining its messages and transport summary", clearedLegacy?.bodyAvailability == .removed && clearedLegacy?.body.isEmpty == true && clearedLegacy?.status == 200 && conversationRecordsWithoutTraces(clearedSnapshot.conversations) == contentBeforeExpiry && !clearedBytes.contains("legacy-private-body-marker"))
+            restored.vm.shutdown()
+        } else { check("retention fixture starts one request", false); harness.vm.shutdown() }
+    } catch { check("retention disk readback fixture", false) }
+
+    for captureAtSend in [false, true] {
+        let diagnostics = DiagnosticsSettingsModel()
+        diagnostics.setCaptureBodies(captureAtSend)
+        let translator = ConversationCheckTranslator(holdInputs: true)
+        let chat = ConversationCheckChat(automatic: false)
+        let harness = ConversationCheckHarness(defaults: defaults, translator: translator, chat: chat, diagnostics: diagnostics)
+        harness.vm.draft = "发送后修改诊断开关"; harness.vm.send()
+        let translating = await conversationCheckWaitAsync { await translator.requests().count == 1 }
+        diagnostics.setCaptureBodies(!captureAtSend)
+        await translator.releaseInputs()
+        _ = await conversationCheckWait { !chat.requests().isEmpty }
+        if let request = chat.requests().first, let runID = UUID(uuidString: request.request_id) {
+            chat.emit(.requestTrace(conversationPrivacyTrace(runID: runID)))
+            chat.emit(.requestTrace(conversationPrivacyTrace(runID: runID, phase: .response)))
+            chat.emit(.completed("保持发送时的采集设置")); chat.finish()
+            let finished = await conversationCheckWait { !harness.vm.isBusy }
+            let trace = harness.vm.messages.last(where: { $0.role == .assistant })?.requestTraces?.first
+            check("in-flight capture stays \(captureAtSend ? "enabled" : "disabled") when settings change during translation", translating && finished && trace?.hasBody == captureAtSend && trace?.bodyAvailability == (captureAtSend ? .available : .notCaptured))
+        } else { check("capture setting fixture starts one request", false) }
+        harness.vm.shutdown()
+    }
+
+    for clearBeforeRequest in [false, true] {
+        let diagnostics = DiagnosticsSettingsModel()
+        diagnostics.setCaptureBodies(true)
+        let chat = ConversationCheckChat(automatic: false)
+        let harness = ConversationCheckHarness(defaults: defaults, chat: chat, diagnostics: diagnostics)
+        harness.vm.draft = "采集中途清除正文"; harness.vm.send()
+        _ = await conversationCheckWait { !chat.requests().isEmpty }
+        if let request = chat.requests().first, let runID = UUID(uuidString: request.request_id) {
+            if clearBeforeRequest { harness.vm.clearRequestBodies(conversationID: harness.vm.selectedID, runID: runID) }
+            chat.emit(.requestTrace(conversationPrivacyTrace(runID: runID)))
+            let recorded = await conversationCheckWait { harness.vm.messages.last(where: { $0.role == .assistant })?.requestTraces?.count == 1 }
+            if !clearBeforeRequest { harness.vm.clearRequestBodies(conversationID: harness.vm.selectedID, runID: runID) }
+            chat.emit(.requestTrace(conversationPrivacyTrace(runID: runID, phase: .response)))
+            chat.emit(.completed("清理后仍然正常完成")); chat.finish()
+            let finished = await conversationCheckWait { !harness.vm.isBusy }
+            let assistant = harness.vm.messages.last { $0.role == .assistant }
+            let stored = harness.store.snapshot.conversations.flatMap(\.messages).flatMap { $0.requestTraces ?? [] }.first
+            check("cleanup \(clearBeforeRequest ? "before" : "after") first trace cannot be undone by the terminal event", recorded && finished && assistant?.state == .complete && assistant?.text == "清理后仍然正常完成" && stored?.phase == .response && stored?.bodyAvailability == .removed && stored?.body.isEmpty == true)
+        } else { check("in-flight cleanup fixture starts one request", false) }
+        harness.vm.shutdown()
+    }
+
+    do {
+        let runID = UUID(), clock = ConversationDiagnosticClock()
+        let trace = conversationPrivacyTrace(runID: runID, phase: .response).persisted(captureBody: true, capturedAt: clock.now)
+        let record = ConversationRecord(messages: [.init(role: .user, text: "不能损坏的输入", runID: runID), .init(role: .assistant, text: "不能损坏的回复", runID: runID, requestTraces: [trace])])
+        let disk = ConversationFailingDiagnosticStore(.init(selectedID: record.id, conversations: [record]))
+        let harness = ConversationCheckHarness(defaults: defaults, persistence: disk, diagnosticNow: { clock.now })
+        disk.failSave = true
+        harness.vm.clearRequestBodies(conversationID: record.id)
+        check("cleanup save failure reports that disk may still retain the body", harness.vm.diagnosticError != nil && harness.vm.persistenceError != nil && harness.vm.messages.last?.requestTraces?.first?.body.isEmpty == true && disk.snapshot.conversations.first?.messages.last?.requestTraces == [trace])
+        disk.failSave = false
+        harness.vm.flushPersistence()
+        check("successful cleanup retry clears the warning and persists only the summary", harness.vm.diagnosticError == nil && harness.vm.persistenceError == nil && disk.snapshot.conversations.first?.messages.last?.requestTraces?.first?.bodyAvailability == .removed && conversationRecordsWithoutTraces(disk.snapshot.conversations) == conversationRecordsWithoutTraces([record]))
+        harness.vm.shutdown()
+    }
+    return checks
+}
+
+@MainActor
+private final class ConversationDiagnosticClock {
+    var now = Date(timeIntervalSince1970: 1_790_000_000)
+}
+
+private final class ConversationFailingDiagnosticStore: ConversationPersisting {
+    var snapshot: ConversationSnapshot
+    var failSave = false
+    init(_ snapshot: ConversationSnapshot) { self.snapshot = snapshot }
+    func load() throws -> ConversationSnapshot { snapshot }
+    func save(_ snapshot: ConversationSnapshot) throws {
+        if failSave { throw ConversationStoreFailure.saveFailed }
+        try snapshot.validate()
+        self.snapshot = snapshot
+    }
+}
+
+private func conversationRecordsWithoutTraces(_ records: [ConversationRecord]) -> [ConversationRecord] {
+    records.map { record in
+        var copy = record
+        for index in copy.messages.indices { copy.messages[index].requestTraces = nil }
+        return copy
+    }
+}
+
+private func conversationPrivacyTrace(runID: UUID, phase: ChatRequestTracePhase = .request) -> ChatRequestTrace {
+    let body = "{\"model\":\"deepseek-flash[1m]\",\"messages\":[{\"role\":\"user\",\"content\":\"diagnostic-only-content-marker\"}],\"metadata\":{\"device_id\":\"fixture-device-identity\"}}"
+    return .init(attemptID: "\(runID.uuidString):1", attempt: 1, phase: phase, wireModel: "deepseek-flash[1m]",
+                 headers: ["content-type": "application/json", "x-claude-code-session-id": "E621719D-B094-41C0-99A1-FA5A5EC652E5"],
+                 proxy: .init(url: "http://127.0.0.1:7897"), body: body, bodyBytes: body.utf8.count,
+                 status: phase == .response ? 200 : nil, durationMS: phase == .request ? nil : 120,
+                 outcome: phase == .request ? nil : "http")
+}
+
+
+@MainActor
+private func conversationProjectLifecycleChecks(defaults: UserDefaults) async -> [(String, Bool)] {
+    var checks: [(String, Bool)] = []
+    func check(_ name: String, _ passed: Bool) { checks.append(("conversation project: " + name, passed)) }
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-project-checks-\(UUID().uuidString)", isDirectory: true)
+    let firstDirectory = root.appendingPathComponent("项目 one", isDirectory: true)
+    let secondDirectory = root.appendingPathComponent("別の project", isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(at: firstDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: secondDirectory, withIntermediateDirectories: true)
+        let firstPath = try ProjectDirectory.normalized(firstDirectory.path)
+        let secondPath = try ProjectDirectory.normalized(secondDirectory.path)
+
+        do {
+            let harness = ConversationCheckHarness(defaults: defaults)
+            let firstID = harness.vm.selectedID!
+            harness.vm.draft = "保留原草稿"
+            check("new sessions begin without a project", harness.vm.selectedConversation?.projectDirectory == nil)
+            check("selection saves a canonical Unicode path", harness.vm.setProjectDirectory(firstDirectory.path, for: firstID) && harness.vm.selectedConversation?.projectDirectory == firstPath)
+            harness.vm.newConversation()
+            let secondID = harness.vm.selectedID!
+            check("another session does not inherit a project", harness.vm.selectedConversation?.projectDirectory == nil)
+            check("late picker selection targets its original session", harness.vm.setProjectDirectory(secondDirectory.path, for: firstID) && harness.vm.selectedID == secondID && harness.vm.selectedConversation?.projectDirectory == nil && harness.vm.conversations.first { $0.id == firstID }?.projectDirectory == secondPath)
+            harness.vm.selectConversation(firstID)
+            check("switching restores the bound directory and original draft", harness.vm.selectedConversation?.projectDirectory == secondPath && harness.vm.draft == "保留原草稿")
+            harness.vm.flushPersistence()
+            let restored = ConversationCheckHarness(defaults: defaults, store: harness.store)
+            check("restart restores selection and bound directory without starting providers", restored.vm.selectedID == firstID && restored.vm.selectedConversation?.projectDirectory == secondPath && restored.chat.requests().isEmpty && restored.translationKey.loads == 0)
+            harness.vm.clearRequestBodies()
+            check("diagnostic cleanup keeps the project binding", harness.vm.selectedConversation?.projectDirectory == secondPath)
+            check("removing a binding preserves session identity and draft", harness.vm.setProjectDirectory(nil, for: firstID) && harness.vm.selectedID == firstID && harness.vm.selectedConversation?.projectDirectory == nil && harness.vm.draft == "保留原草稿")
+            harness.vm.deleteConversation(firstID)
+            check("late picker completion cannot recreate a deleted session", !harness.vm.setProjectDirectory(firstPath, for: firstID) && !harness.vm.conversations.contains { $0.id == firstID } && harness.vm.selectedID == secondID)
+            harness.vm.shutdown(); restored.vm.shutdown()
+        }
+
+        do {
+            let missing = root.appendingPathComponent("removed", isDirectory: true)
+            try FileManager.default.createDirectory(at: missing, withIntermediateDirectories: true)
+            let harness = ConversationCheckHarness(defaults: defaults)
+            let id = harness.vm.selectedID!
+            _ = harness.vm.setProjectDirectory(missing.path, for: id)
+            harness.vm.draft = "不应发送到纯文本模式"
+            try FileManager.default.removeItem(at: missing)
+            harness.vm.send()
+            let translationRequests = await harness.translator.requests()
+            check("missing project blocks send before translation or credentials", !harness.vm.isBusy && harness.vm.messages.isEmpty && harness.chat.requests().isEmpty && translationRequests.isEmpty && harness.translationKey.loads == 0 && harness.executionKey.loads == 0)
+            check("missing project retains the draft and binding with an actionable error", harness.vm.draft == "不应发送到纯文本模式" && harness.vm.selectedConversation?.projectDirectory != nil && harness.vm.projectDirectoryError?.contains("重新选择") == true)
+            check("choosing a valid replacement clears the directory error", harness.vm.setProjectDirectory(firstPath, for: id) && harness.vm.projectDirectoryError == nil)
+            harness.vm.shutdown()
+        }
+
+        do {
+            let disappearing = root.appendingPathComponent("removed-during-translation", isDirectory: true)
+            try FileManager.default.createDirectory(at: disappearing, withIntermediateDirectories: true)
+            let translator = ConversationCheckTranslator(holdInputs: true)
+            let harness = ConversationCheckHarness(defaults: defaults, translator: translator)
+            _ = harness.vm.setProjectDirectory(disappearing.path, for: harness.vm.selectedID!)
+            harness.vm.draft = "执行前再次检查目录"
+            harness.vm.send()
+            _ = await conversationCheckWaitAsync { await translator.requests().count == 1 }
+            try FileManager.default.removeItem(at: disappearing)
+            await translator.releaseInputs()
+            let finished = await conversationCheckWait { !harness.vm.isBusy }
+            check("directory disappearance during translation prevents VM execution", finished && harness.chat.requests().isEmpty && harness.vm.messages.last(where: { $0.role == .assistant })?.state == .failed && harness.vm.messages.last(where: { $0.role == .assistant })?.error?.contains("重新选择") == true)
+            check("pre-execution directory failure never removes the binding or draft", harness.vm.selectedConversation?.projectDirectory != nil && harness.vm.draft == "执行前再次检查目录")
+            harness.vm.shutdown()
+        }
+
+        do {
+            let translator = ConversationCheckTranslator(holdInputs: true)
+            let chat = ConversationCheckChat(automatic: false)
+            let harness = ConversationCheckHarness(defaults: defaults, translator: translator, chat: chat)
+            let firstID = harness.vm.selectedID!
+            _ = harness.vm.setProjectDirectory(firstPath, for: firstID)
+            harness.vm.draft = "保持发送时的项目目录"
+            harness.vm.send()
+            let translating = await conversationCheckWaitAsync { await translator.requests().count == 1 }
+            check("running session cannot change or remove its project", !harness.vm.canChangeProjectDirectory && !harness.vm.setProjectDirectory(secondPath, for: firstID) && !harness.vm.setProjectDirectory(nil, for: firstID) && harness.vm.selectedConversation?.projectDirectory == firstPath)
+            harness.vm.newConversation()
+            let secondID = harness.vm.selectedID!
+            check("another session can choose its own directory during execution", harness.vm.canChangeProjectDirectory && harness.vm.setProjectDirectory(secondPath, for: secondID))
+            await translator.releaseInputs()
+            let started = await conversationCheckWait { chat.requests().count == 1 }
+            check("in-flight request freezes the original session directory", translating && started && chat.requests().first?.project?.directory == firstPath && chat.requests().first?.conversationSessionID == firstID)
+            chat.emit(.toolActivity(tool: "Read", phase: "started", toolID: "read-1"))
+            let reading = await conversationCheckWait { harness.vm.conversations.first { $0.id == firstID }?.messages.contains { $0.role == .activity && $0.text == "读取文件（Read）：开始" && $0.state == .running } == true }
+            chat.emit(.toolActivity(tool: "Read", phase: "completed", toolID: "read-1"))
+            for tool in ["Write", "Edit", "Bash", "Glob", "Grep"] {
+                chat.emit(.toolActivity(tool: tool, phase: "started", toolID: "tool-\(tool)"))
+                chat.emit(.toolActivity(tool: tool, phase: tool == "Bash" ? "failed" : "completed", toolID: "tool-\(tool)"))
+            }
+            chat.emit(.completed("项目执行完成")); chat.finish()
+            let finished = await conversationCheckWait { !harness.vm.isBusy }
+            let activities = harness.vm.conversations.first { $0.id == firstID }?.messages.filter { $0.role == .activity } ?? []
+            check("tool activity stays in the originating session and completes without raw inputs", reading && finished && harness.vm.selectedID == secondID && harness.vm.messages.isEmpty && activities.contains { $0.text == "读取文件（Read）：完成" && $0.state == .complete } && activities.contains { $0.text == "运行项目命令（Bash）：失败" && $0.state == .failed } && activities.filter { $0.text.contains("）：完成") }.count == 5)
+            check("finished session unlocks its project selection", harness.vm.canChangeProjectDirectory(in: firstID) && harness.vm.setProjectDirectory(secondPath, for: firstID))
+            harness.vm.shutdown()
+        }
+
+        do {
+            let chat = ConversationCheckChat(automatic: false)
+            let harness = ConversationCheckHarness(defaults: defaults, chat: chat)
+            _ = harness.vm.setProjectDirectory(firstPath, for: harness.vm.selectedID!)
+            harness.vm.draft = "停止项目命令"
+            harness.vm.send()
+            _ = await conversationCheckWait { chat.requests().count == 1 }
+            chat.emit(.toolActivity(tool: "Bash", phase: "started", toolID: "command-1"))
+            _ = await conversationCheckWait { harness.vm.messages.contains { $0.role == .activity && $0.text.contains("（Bash）：开始") } }
+            harness.vm.stop()
+            let finished = await conversationCheckWait { !harness.vm.isBusy }
+            check("cancellation settles tool activity and retains the project", finished && harness.vm.messages.contains { $0.role == .activity && $0.text == "Bash：已停止" && $0.state == .cancelled } && harness.vm.selectedConversation?.projectDirectory == firstPath && harness.vm.canChangeProjectDirectory)
+            harness.vm.shutdown()
+        }
+
+        do {
+            let chat = ConversationCheckChat(automatic: false)
+            let harness = ConversationCheckHarness(defaults: defaults, chat: chat)
+            _ = harness.vm.setProjectDirectory(firstPath, for: harness.vm.selectedID!)
+            harness.vm.draft = "项目工具循环请求记录"
+            harness.vm.send()
+            _ = await conversationCheckWait { chat.requests().count == 1 }
+            if let request = chat.requests().first, let runID = UUID(uuidString: request.request_id) {
+                for attempt in 1...24 {
+                    for phase: ChatRequestTracePhase in [.request, .response] {
+                        let base = requestTraceFixture(runID: runID, phase: phase)
+                        let trace = ChatRequestTrace(attemptID: "\(runID.uuidString):\(attempt)", attempt: attempt, phase: phase,
+                            wireModel: base.wireModel, headers: base.headers, proxy: base.proxy, body: base.body,
+                            bodyBytes: base.bodyBytes, status: base.status, durationMS: base.durationMS, outcome: base.outcome)
+                        chat.emit(.requestTrace(trace))
+                    }
+                }
+                chat.emit(.completed("请求循环完成")); chat.finish()
+                let finished = await conversationCheckWait { !harness.vm.isBusy }
+                let assistant = harness.vm.messages.last { $0.role == .assistant }
+                check("project execution accepts and persists up to 24 sequential request traces", finished && assistant?.state == .complete && assistant?.requestTraces?.count == 24 && harness.store.snapshot.schemaVersion == 3 && harness.vm.persistenceError == nil)
+            } else { check("project trace fixture starts one request", false) }
+            harness.vm.shutdown()
+        }
+    } catch { check("temporary project fixture setup or operation", false) }
+    if FileManager.default.fileExists(atPath: root.path) {
+        do { try FileManager.default.removeItem(at: root) }
+        catch { check("temporary project fixture cleanup", false) }
+    }
+    return checks
 }

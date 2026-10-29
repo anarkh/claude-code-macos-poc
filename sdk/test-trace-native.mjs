@@ -44,6 +44,8 @@ const FAKE_API_KEY = 'sk-HOST-ONLY-INERT-REQUEST-TRACE-NATIVE-FIXTURE';
 const ACK = 'REQUEST_TRACE_NATIVE_OK';
 const SSE_END_DELAY_MS = 180;
 const knownSecrets = [FAKE_API_KEY, FAKE_SUBSCRIPTION_TOKEN];
+const TEXT_IDENTITY_CONTRACT = 'app-install-conversation/v1';
+const IDENTITY = Object.freeze({ device_id: '5'.repeat(64), session_id: 'a344b06d-c33e-4ae2-84dd-ce2dd038ad30' });
 const receipts = [], artifacts = [];
 const hashBytes = bytes => createHash('sha256').update(bytes).digest('hex');
 
@@ -83,16 +85,18 @@ function inputFor(provider, model) {
   const input = { ...SUBSCRIPTION_INPUT, request_id: randomUUID(), provider, model,
     text_skills: [{ name: 'Local trace fixture', content: `Answer the latest question. Inert host-only marker: ${credential}` }] };
   if (provider === 'deepseek-api') { delete input.subscriptionToken; input.apiKey = credential; }
+  else input.identity = { ...IDENTITY };
   return input;
 }
 
 async function run(root, label, input, mode = 'success') {
   const began = performance.now(), controller = new AbortController();
-  let sent = '', providerCalls = 0, observedBody, observedHeaders, nativeModel;
+  let sent = '', providerCalls = 0, launchCount = 0, observedBody, observedHeaders, nativeModel;
   let sseStarted, sseEnded, terminalTraceAt;
   const kinds = [], events = [];
   const dependencies = { testOnly: true, signal: controller.signal,
     launch: async () => {
+      launchCount++;
       const child = await productionLauncher(root);
       const originalWrite = child.stdin.write.bind(child.stdin);
       child.stdin.write = (...args) => { sent += String(args[0]); return originalWrite(...args); };
@@ -112,6 +116,10 @@ async function run(root, label, input, mode = 'success') {
       observedBody = JSON.stringify(parameters.body); observedHeaders = parameters.headers;
       assert.deepEqual(parameters.body.messages, input.messages.map(({ role, text }) => ({ role, content: text })));
       assert.equal(parameters.body.tools.length, 0);
+      if (input.identity) {
+        assert.deepEqual(JSON.parse(parameters.body.metadata.user_id), { ...input.identity, account_uuid: '' });
+        assert.equal(parameters.headers['x-claude-code-session-id'], input.identity.session_id);
+      }
       assert(!observedBody.includes('/Users/') && !observedBody.includes('/home/claude'), 'HOST_OR_GUEST_PATH_IN_PROVIDER_BODY');
       if (mode === 'proxy-failure') return officialTransport(parameters);
       if (mode === 'cancel-active') return { statusCode: 200, contentType: 'text/event-stream', stream: (async function* () {
@@ -132,6 +140,15 @@ async function run(root, label, input, mode = 'success') {
     if (event.type === 'request_trace' && event.trace.phase !== 'request') terminalTraceAt = performance.now();
   }, dependencies, root);
   const traces = events.filter(event => event.type === 'request_trace').map(event => event.trace);
+  if (mode === 'identity-unsupported') {
+    assert.equal(terminal.type, 'error'); assert.equal(terminal.code, 'VM_IDENTITY_UNSUPPORTED');
+    assert.equal(launchCount, 0); assert.equal(providerCalls, 0); assert.equal(traces.length, 0); assert.equal(kinds.length, 0); assert.equal(sent, '');
+    receipts.push({ runtime: label, provider: input.provider, selector: input.model, mode,
+      terminal: terminal.type, error_code: terminal.code, native_launches: 0, provider_calls: 0,
+      identity_requirement_failed_before_native_launch: true, real_provider_calls: false });
+    return;
+  }
+  assert.equal(launchCount, 1, 'EXPECTED_ONE_NATIVE_LAUNCH');
   assert.equal(providerCalls, 1, 'EXPECTED_ONE_PROVIDER_ATTEMPT');
   assert.equal(traces.length, 2, 'EXPECTED_REQUEST_AND_TERMINAL_TRACE');
   const [request, final] = traces;
@@ -200,8 +217,16 @@ try {
   const roots = [{ root: runtimeRoot, label: 'active' }, ...(rollbackRoot ? [{ root: rollbackRoot, label: 'rollback' }] : [])];
   for (const { root, label } of roots) {
     const before = await inventory(root);
+    const protocol = await import(pathToFileURL(path.join(root, 'sdk/deepseek-text-chat.mjs')).href);
+    const identitySupported = protocol.TEXT_IDENTITY_CONTRACT === TEXT_IDENTITY_CONTRACT;
+    if (label === 'active') assert.equal(identitySupported, true, 'ACTIVE_RUNTIME_IDENTITY_CONTRACT_REQUIRED');
+    else if (!identitySupported) await run(root, label, inputFor('claude-subscription', 'sonnet'), 'identity-unsupported');
     await run(root, label, inputFor('deepseek-api', 'deepseek-flash[1m]'));
-    for (const model of ['sonnet', 'opus', 'haiku']) await run(root, label, inputFor('claude-subscription', model));
+    for (const model of ['sonnet', 'opus', 'haiku']) {
+      const input = inputFor('claude-subscription', model);
+      if (!identitySupported) delete input.identity; // Explicit legacy compatibility check, never a production fallback.
+      await run(root, label, input);
+    }
     if (label === 'active') {
       const reserved = createServer(); reserved.listen(0, '127.0.0.1'); await once(reserved, 'listening');
       const port = reserved.address().port; await new Promise(resolve => reserved.close(resolve));

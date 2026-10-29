@@ -90,7 +90,7 @@ func conversationStoreChecks() -> [(String, Bool)] {
         expectFailure("unknown_selected_session_rejected", .invalidSelection) { try store.save(badSelection) }
         var badLanguage = updated; badLanguage.conversations[0].targetLanguage = "zh"
         expectFailure("unknown_target_language_rejected", .invalidLanguage) { try store.save(badLanguage) }
-        var futureVersion = updated; futureVersion.schemaVersion = 2
+        var futureVersion = updated; futureVersion.schemaVersion = 4
         expectFailure("unsupported_save_version_rejected", .unsupportedVersion) { try store.save(futureVersion) }
         check("validation_failure_preserves_previous_bytes", try Data(contentsOf: fileURL) == bytesBeforeFailure)
 
@@ -104,7 +104,7 @@ func conversationStoreChecks() -> [(String, Bool)] {
             check(name + "_original_bytes_retained", try Data(contentsOf: fileURL) == invalidBytes)
             try bytesBeforeFailure.write(to: fileURL)
         }
-        try invalidStored("unsupported_file_version", .unsupportedVersion) { $0["schemaVersion"] = 2 }
+        try invalidStored("unsupported_file_version", .unsupportedVersion) { $0["schemaVersion"] = 4 }
         try invalidStored("unknown_snapshot_field", .invalidFormat) { $0["apiKey"] = "fixture-only-not-a-credential" }
         try invalidStored("duplicate_record_file", .duplicateConversationID) { payload in
             var records = payload["conversations"] as! [[String: Any]]; records.append(records[0]); payload["conversations"] = records
@@ -153,6 +153,195 @@ func conversationStoreChecks() -> [(String, Bool)] {
             do { try FileManager.default.removeItem(at: root) }
             catch { check("failed_test_cleanup", false) }
         }
+    }
+    results.append(contentsOf: conversationProjectStoreChecks())
+    results.append(contentsOf: conversationTracePrivacyStoreChecks())
+    return results
+}
+
+private func conversationProjectStoreChecks() -> [(String, Bool)] {
+    var results: [(String, Bool)] = []
+    func check(_ name: String, _ passed: Bool) { results.append(("conversation_store_project_" + name, passed)) }
+    func expectInvalid(_ name: String, operation: () throws -> Void) {
+        do { try operation(); check(name, false) }
+        catch let failure as ConversationStoreFailure { check(name, failure == .invalidFormat) }
+        catch { check(name, false) }
+    }
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-project-store-\(UUID().uuidString)", isDirectory: true)
+    let project = root.appendingPathComponent("selected-project", isDirectory: true)
+    let fileURL = root.appendingPathComponent("conversations.json")
+    let store = FileConversationStore(fileURL: fileURL)
+    let record = ConversationRecord(title: "Project history", draft: "Preserved draft", projectDirectory: project.path,
+                                    messages: [.init(role: .user, text: "Preserved project message")])
+    let snapshot = ConversationSnapshot(selectedID: record.id, conversations: [record])
+    do {
+        check("new_snapshot_defaults_to_v3", ConversationSnapshot().schemaVersion == 3)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try store.save(snapshot)
+        let originalBytes = try Data(contentsOf: fileURL)
+        check("v3_selected_directory_survives_restart", try FileConversationStore(fileURL: fileURL).load() == snapshot)
+        let payload = try JSONSerialization.jsonObject(with: originalBytes) as! [String: Any]
+        let records = payload["conversations"] as! [[String: Any]]
+        check("v3_directory_is_persisted", payload["schemaVersion"] as? Int == 3 && records[0]["projectDirectory"] as? String == project.path)
+        try FileManager.default.removeItem(at: project)
+        let missingDirectoryReadback = try store.load()
+        check("missing_directory_preserves_readable_history", !FileManager.default.fileExists(atPath: project.path) && missingDirectoryReadback == snapshot)
+        check("missing_directory_does_not_rewrite_history", try Data(contentsOf: fileURL) == originalBytes)
+
+        func rejectStored(_ name: String, bytes: Data, destination: URL, validBytes: Data) throws {
+            try bytes.write(to: destination)
+            let invalidStore = FileConversationStore(fileURL: destination)
+            expectInvalid(name + "_read_rejected") { _ = try invalidStore.load() }
+            expectInvalid(name + "_replacement_rejected") { try invalidStore.save(.empty) }
+            check(name + "_original_bytes_retained", try Data(contentsOf: destination) == bytes)
+            try validBytes.write(to: destination)
+        }
+        let invalidPaths = ["", ".", "relative/project", "/", "//tmp/project", "/tmp//project", "/tmp/project/", "/tmp/./project", "/tmp/../project", "/tmp/project\0suffix"]
+        for (index, path) in invalidPaths.enumerated() {
+            var invalid = snapshot
+            invalid.conversations[0].projectDirectory = path
+            expectInvalid("invalid_path_\(index)_save_rejected") { try store.save(invalid) }
+            check("invalid_path_\(index)_failed_save_preserves_history", try Data(contentsOf: fileURL) == originalBytes)
+            try rejectStored("invalid_path_\(index)", bytes: JSONEncoder().encode(invalid), destination: fileURL, validBytes: originalBytes)
+        }
+
+        for version in [1, 2] {
+            var legacy = snapshot
+            legacy.schemaVersion = version
+            legacy.conversations[0].projectDirectory = nil
+            let legacyFile = root.appendingPathComponent("v\(version).json")
+            let legacyStore = FileConversationStore(fileURL: legacyFile)
+            try legacyStore.save(legacy)
+            let legacyBytes = try Data(contentsOf: legacyFile)
+            let readback = try FileConversationStore(fileURL: legacyFile).load()
+            let legacyBytesAfterLoad = try Data(contentsOf: legacyFile)
+            check("v\(version)_reads_without_directory_or_rewrite", readback == legacy && readback.conversations[0].projectDirectory == nil && legacyBytesAfterLoad == legacyBytes)
+            var invalidLegacy = legacy
+            invalidLegacy.conversations[0].projectDirectory = project.path
+            expectInvalid("v\(version)_directory_save_rejected") { try legacyStore.save(invalidLegacy) }
+            check("v\(version)_failed_save_preserves_history", try Data(contentsOf: legacyFile) == legacyBytes)
+            for (name, value) in [("path", project.path as Any), ("null", NSNull() as Any)] {
+                var invalidPayload = try JSONSerialization.jsonObject(with: legacyBytes) as! [String: Any]
+                var invalidRecords = invalidPayload["conversations"] as! [[String: Any]]
+                invalidRecords[0]["projectDirectory"] = value
+                invalidPayload["conversations"] = invalidRecords
+                try rejectStored("v\(version)_directory_\(name)", bytes: JSONSerialization.data(withJSONObject: invalidPayload, options: [.sortedKeys]), destination: legacyFile, validBytes: legacyBytes)
+            }
+        }
+
+        let runID = UUID()
+        let traces = (1...25).map { requestTraceFixture(runID: runID, attempt: $0, phase: .response) }
+        let tracedRecord = ConversationRecord(projectDirectory: project.path, messages: [
+            .init(role: .user, text: "Project turn", runID: runID),
+            .init(role: .assistant, text: "Project result", runID: runID, requestTraces: Array(traces.prefix(24)))
+        ])
+        var tracedSnapshot = ConversationSnapshot(selectedID: tracedRecord.id, conversations: [tracedRecord])
+        let traceFile = root.appendingPathComponent("traces.json")
+        let traceStore = FileConversationStore(fileURL: traceFile)
+        try traceStore.save(tracedSnapshot)
+        let traceBytes = try Data(contentsOf: traceFile)
+        check("v3_twenty_four_traces_roundtrip", try FileConversationStore(fileURL: traceFile).load() == tracedSnapshot)
+        tracedSnapshot.conversations[0].messages[1].requestTraces = traces
+        expectInvalid("v3_twenty_five_traces_save_rejected") { try traceStore.save(tracedSnapshot) }
+        check("v3_trace_limit_failure_preserves_history", try Data(contentsOf: traceFile) == traceBytes)
+        try rejectStored("v3_twenty_five_traces", bytes: JSONEncoder().encode(tracedSnapshot), destination: traceFile, validBytes: traceBytes)
+        for version in [1, 2] {
+            tracedSnapshot.schemaVersion = version
+            tracedSnapshot.conversations[0].projectDirectory = nil
+            tracedSnapshot.conversations[0].messages[1].requestTraces = Array(traces.prefix(3))
+            try traceStore.save(tracedSnapshot)
+            let legacyTraceBytes = try Data(contentsOf: traceFile)
+            check("v\(version)_three_traces_roundtrip", try traceStore.load() == tracedSnapshot)
+            tracedSnapshot.conversations[0].messages[1].requestTraces = Array(traces.prefix(4))
+            expectInvalid("v\(version)_four_traces_save_rejected") { try traceStore.save(tracedSnapshot) }
+            check("v\(version)_trace_limit_failure_preserves_history", try Data(contentsOf: traceFile) == legacyTraceBytes)
+            try rejectStored("v\(version)_four_traces", bytes: JSONEncoder().encode(tracedSnapshot), destination: traceFile, validBytes: legacyTraceBytes)
+        }
+    } catch { check("setup_or_operation_failure", false) }
+    if FileManager.default.fileExists(atPath: root.path) {
+        do { try FileManager.default.removeItem(at: root) }
+        catch { check("temporary_store_cleanup", false) }
+    }
+    return results
+}
+
+private func conversationTracePrivacyStoreChecks() -> [(String, Bool)] {
+    var results: [(String, Bool)] = []
+    func check(_ name: String, _ passed: Bool) { results.append(("conversation_store_privacy_" + name, passed)) }
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-trace-privacy-\(UUID().uuidString)", isDirectory: true)
+    let fileURL = root.appendingPathComponent("conversations.json")
+    let store = FileConversationStore(fileURL: fileURL)
+    let runID = UUID()
+    let capturedAt = Date(timeIntervalSince1970: 1_800_000_000)
+    let bodyMarker = "synthetic-sensitive-body-only-in-diagnostic-record"
+    let body = "{\"model\":\"deepseek-flash[1m]\",\"messages\":[{\"role\":\"user\",\"content\":\"\(bodyMarker)\"}]}"
+    let legacy = requestTraceFixture(runID: runID, phase: .response, body: body)
+    let user = ConversationMessage(role: .user, text: "preserved user message", createdAt: capturedAt, runID: runID)
+    let assistant = ConversationMessage(role: .assistant, text: "preserved assistant answer", createdAt: capturedAt,
+                                        runID: runID, requestTraces: [legacy])
+    let record = ConversationRecord(title: "preserved title", createdAt: capturedAt, updatedAt: capturedAt,
+                                    draft: "preserved draft", messages: [user, assistant])
+    let legacySnapshot = ConversationSnapshot(schemaVersion: 1, selectedID: record.id, conversations: [record])
+    do {
+        try store.save(legacySnapshot)
+        let legacyBytes = try Data(contentsOf: fileURL)
+        let legacyReadback = try FileConversationStore(fileURL: fileURL).load()
+        let legacyBytesAfterLoad = try Data(contentsOf: fileURL)
+        check("v1_snapshot_reads_without_rewriting", legacyReadback == legacySnapshot && legacyBytesAfterLoad == legacyBytes)
+        check("v1_body_survives_without_assumed_retention", legacyReadback.conversations[0].messages[1].requestTraces?.first?.removingExpiredBody(now: capturedAt.addingTimeInterval(365 * 86_400)) == legacy)
+        check("new_snapshot_defaults_to_v3", ConversationSnapshot().schemaVersion == 3)
+
+        let summary = legacy.persisted(captureBody: false, capturedAt: capturedAt)
+        let full = legacy.persisted(captureBody: true, capturedAt: capturedAt)
+        let expired = full.removingExpiredBody(now: capturedAt.addingTimeInterval(86_400))
+        let removedLegacy = legacy.removingBody()
+        for (name, trace) in [("summary", summary), ("full", full), ("expired", expired), ("removed_legacy", removedLegacy)] {
+            var next = legacySnapshot
+            next.schemaVersion = 2
+            next.conversations[0].messages[1].requestTraces = [trace]
+            try store.save(next)
+            let readback = try FileConversationStore(fileURL: fileURL).load()
+            check("v2_\(name)_roundtrip", readback == next)
+            check("v2_\(name)_preserves_conversation", readback.conversations[0].id == record.id && readback.selectedID == record.id && readback.conversations[0].title == record.title && readback.conversations[0].draft == record.draft && readback.conversations[0].messages[0] == user && readback.conversations[0].messages[1].text == assistant.text)
+            let bytes = try Data(contentsOf: fileURL)
+            let persisted = String(decoding: bytes, as: UTF8.self)
+            check("v2_\(name)_body_presence_matches_policy", persisted.contains(bodyMarker) == trace.hasBody)
+            check("v2_\(name)_keeps_original_body_byte_count", readback.conversations[0].messages[1].requestTraces?.first?.bodyBytes == legacy.bodyBytes)
+        }
+        let projectFile = root.appendingPathComponent("project/conversations.json")
+        let projectStore = FileConversationStore(fileURL: projectFile)
+        var projectSnapshot = legacySnapshot
+        projectSnapshot.schemaVersion = 3
+        projectSnapshot.conversations[0].projectDirectory = root.appendingPathComponent("selected-project").path
+        for (name, trace) in [("summary", summary), ("full", full), ("expired", expired), ("removed_legacy", removedLegacy)] {
+            projectSnapshot.conversations[0].messages[1].requestTraces = [trace]
+            try projectStore.save(projectSnapshot)
+            let readback = try FileConversationStore(fileURL: projectFile).load()
+            check("v3_\(name)_preserves_directory_and_conversation", readback == projectSnapshot && readback.conversations[0].projectDirectory == projectSnapshot.conversations[0].projectDirectory)
+            check("v3_\(name)_body_presence_matches_policy", String(decoding: try Data(contentsOf: projectFile), as: UTF8.self).contains(bodyMarker) == trace.hasBody)
+        }
+        let validBytes = try Data(contentsOf: fileURL)
+        var invalid = try JSONSerialization.jsonObject(with: validBytes) as! [String: Any]
+        var records = invalid["conversations"] as! [[String: Any]]
+        var messages = records[0]["messages"] as! [[String: Any]]
+        var traces = messages[1]["requestTraces"] as! [[String: Any]]
+        traces[0].removeValue(forKey: "expires_at")
+        messages[1]["requestTraces"] = traces
+        records[0]["messages"] = messages
+        invalid["conversations"] = records
+        let invalidBytes = try JSONSerialization.data(withJSONObject: invalid, options: [.sortedKeys])
+        try invalidBytes.write(to: fileURL)
+        do { _ = try store.load(); check("incompatible_v2_trace_read_rejected", false) }
+        catch let failure as ConversationStoreFailure { check("incompatible_v2_trace_read_rejected", failure == .invalidFormat) }
+        catch { check("incompatible_v2_trace_read_rejected", false) }
+        do { try store.save(.empty); check("incompatible_v2_trace_save_rejected", false) }
+        catch let failure as ConversationStoreFailure { check("incompatible_v2_trace_save_rejected", failure == .invalidFormat) }
+        catch { check("incompatible_v2_trace_save_rejected", false) }
+        check("incompatible_v2_trace_original_bytes_retained", try Data(contentsOf: fileURL) == invalidBytes)
+    } catch { check("setup_or_operation_failure", false) }
+    if FileManager.default.fileExists(atPath: root.path) {
+        do { try FileManager.default.removeItem(at: root) }
+        catch { check("temporary_store_cleanup", false) }
     }
     return results
 }

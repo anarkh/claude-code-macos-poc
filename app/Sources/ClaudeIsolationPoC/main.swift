@@ -22,9 +22,13 @@ struct ClaudeIsolationApplication: App {
     @StateObject private var loginReset: ClaudeLoginResetModel
     @StateObject private var runtimeVersion: RuntimeVersionViewModel
     @StateObject private var browser: BrowserVMController
+    @StateObject private var diagnostics: DiagnosticsSettingsModel
+    @StateObject private var deviceIdentity: DeviceIdentitySettingsModel
     init() {
         let fixtureOnly = CommandLine.arguments.contains("--ui-fixture")
         let testingUI = fixtureOnly || CommandLine.arguments.contains("--smoke-test")
+        let diagnostics = DiagnosticsSettingsModel(defaults: testingUI ? nil : UserDefaults.standard)
+        _diagnostics = StateObject(wrappedValue: diagnostics)
         // UI fixtures must never scan the user's HOME or real run directories.
         let resetFixtureRoot: URL?
         if testingUI {
@@ -35,6 +39,10 @@ struct ClaudeIsolationApplication: App {
             resetFixtureRoot = URL(fileURLWithPath: String(cString: physical), isDirectory: true)
             free(physical)
         } else { resetFixtureRoot = nil }
+        let identityStore = FileInstallationIdentityStore(directoryURL:
+            resetFixtureRoot?.appendingPathComponent("Identity", isDirectory: true)
+                ?? FileInstallationIdentityStore.defaultDirectoryURL)
+        _deviceIdentity = StateObject(wrappedValue: DeviceIdentitySettingsModel(store: identityStore))
         let executionConfigurationStore: ExecutionConfigurationStore
         let translationConfigurationStore: TranslationConfigurationStore
         let browserSettingsStore: BrowserSettingsStore
@@ -66,6 +74,12 @@ struct ClaudeIsolationApplication: App {
             executionCredentials = FileCredentialStore(scope: .execution)
             subscriptionCredentials = FileCredentialStore(scope: .subscription)
         }
+        let subscriptionAccountStore: any SubscriptionAccountStoring
+        if testingUI {
+            subscriptionAccountStore = MemorySubscriptionAccountStore()
+        } else {
+            subscriptionAccountStore = FileSubscriptionAccountStore(legacyCredentials: subscriptionCredentials)
+        }
         let skillStore: any TextSkillPersisting
         if testingUI { skillStore = MemoryTextSkillStore() }
         else { skillStore = FileTextSkillStore() }
@@ -87,7 +101,14 @@ struct ClaudeIsolationApplication: App {
                 profileDirectoryURL: resetFixtureRoot?.appendingPathComponent("Browser") ?? BrowserRuntimeStorage.defaultDirectoryURL),
                 settingsStore: browserSettingsStore, fixtureOnly: testingUI)
             _browser = StateObject(wrappedValue: browser)
-            let execution = ExecutionViewModel(store: executionConfigurationStore, credentials: executionCredentials, subscriptionCredentials: subscriptionCredentials, tester: StdioExecutionConnectionTester(configuration: configuration))
+            let quotaService: any SubscriptionQuotaFetching = testingUI
+                ? FixtureSubscriptionQuotaService() : StdioSubscriptionQuotaService(configuration: configuration)
+            let accounts = SubscriptionAccountsModel(store: subscriptionAccountStore, quotaService: quotaService)
+            _ = accounts.load()
+            let execution = ExecutionViewModel(store: executionConfigurationStore, credentials: executionCredentials,
+                subscriptionCredentials: subscriptionCredentials,
+                tester: StdioExecutionConnectionTester(configuration: configuration, installationIdentityStore: identityStore),
+                subscriptionAccounts: accounts)
             let translator = StdioTranslationProvider(configuration: configuration, fixtureOnly: fixtureOnly)
             let model = TranslationViewModel(provider: translator, configurationStore: translationConfigurationStore, credentials: translationCredentials)
             if fixtureOnly {
@@ -104,9 +125,10 @@ struct ClaudeIsolationApplication: App {
                 conversationStore = FileConversationStore()
             }
             let chat = ConversationViewModel(translation: model, execution: execution, translator: translator,
-                provider: StdioChatProvider(configuration: configuration, fixtureOnly: fixtureOnly),
+                provider: StdioChatProvider(configuration: configuration, fixtureOnly: fixtureOnly, installationIdentityStore: identityStore),
                 store: conversationStore, translationCredentials: translationCredentials,
-                executionCredentials: executionCredentials, subscriptionCredentials: subscriptionCredentials, fixtureOnly: fixtureOnly, skills: skills)
+                executionCredentials: executionCredentials, subscriptionCredentials: subscriptionCredentials, fixtureOnly: fixtureOnly, skills: skills,
+                diagnostics: diagnostics)
             _model = StateObject(wrappedValue: model)
             _execution = StateObject(wrappedValue: execution)
             _chat = StateObject(wrappedValue: chat)
@@ -122,6 +144,7 @@ struct ClaudeIsolationApplication: App {
                     bundleContents: Bundle.main.bundleURL.appendingPathComponent("Contents")),
                 updateConfigurationStore: updateConfigurationStore)
             _runtimeVersion = StateObject(wrappedValue: runtimeVersion)
+            configureAccountLifecycle(accounts, chat: chat, execution: execution, loginReset: loginReset, runtimeVersion: runtimeVersion)
             terminationCoordinator = ApplicationTerminationCoordinator(chat: chat, execution: execution,
                 translation: model, loginReset: loginReset, runtimeVersions: runtimeVersion, browser: browser)
         } catch {
@@ -130,14 +153,18 @@ struct ClaudeIsolationApplication: App {
                 profileDirectoryURL: resetFixtureRoot?.appendingPathComponent("Browser") ?? BrowserRuntimeStorage.defaultDirectoryURL),
                 settingsStore: browserSettingsStore, fixtureOnly: testingUI)
             _browser = StateObject(wrappedValue: browser)
-            let execution = ExecutionViewModel(store: executionConfigurationStore, credentials: executionCredentials, subscriptionCredentials: subscriptionCredentials)
+            let accounts = SubscriptionAccountsModel(store: subscriptionAccountStore)
+            _ = accounts.load()
+            let execution = ExecutionViewModel(store: executionConfigurationStore, credentials: executionCredentials,
+                subscriptionCredentials: subscriptionCredentials, subscriptionAccounts: accounts)
             let model = TranslationViewModel(provider: UnavailableTranslationProvider(), configurationStore: translationConfigurationStore, credentials: translationCredentials)
             _execution = StateObject(wrappedValue: execution)
             _model = StateObject(wrappedValue: model)
             let chat = ConversationViewModel(translation: model, execution: execution,
                 translator: UnavailableTranslationProvider(), provider: UnavailableChatProvider(),
                 store: testingUI ? MemoryConversationStore() : FileConversationStore(),
-                translationCredentials: translationCredentials, executionCredentials: executionCredentials, subscriptionCredentials: subscriptionCredentials, skills: skills)
+                translationCredentials: translationCredentials, executionCredentials: executionCredentials, subscriptionCredentials: subscriptionCredentials, skills: skills,
+                diagnostics: diagnostics)
             _chat = StateObject(wrappedValue: chat)
             let loginReset = ClaudeLoginResetModel(chat: chat, execution: execution, translation: model,
                 runtime: OwnedRuntimeCleanupService(tempRoot: resetFixtureRoot),
@@ -147,6 +174,7 @@ struct ClaudeIsolationApplication: App {
                 chat.isTerminationWorkSettled && execution.isTerminationWorkSettled && model.isTerminationWorkSettled && !loginReset.isBusy
             }, updateConfigurationStore: updateConfigurationStore)
             _runtimeVersion = StateObject(wrappedValue: runtimeVersion)
+            configureAccountLifecycle(accounts, chat: chat, execution: execution, loginReset: loginReset, runtimeVersion: runtimeVersion)
             terminationCoordinator = ApplicationTerminationCoordinator(chat: chat, execution: execution,
                 translation: model, loginReset: loginReset, runtimeVersions: runtimeVersion, browser: browser)
         }
@@ -154,7 +182,7 @@ struct ClaudeIsolationApplication: App {
     }
     var body: some Scene {
         WindowGroup("Claude 隔离工作台") {
-            ContentView(chat: chat, browser: browser, configuration: configuration)
+            ContentView(chat: chat, browser: browser, execution: execution, configuration: configuration)
                 .onAppear {
                     if CommandLine.arguments.contains("--ui-flow-test") && CommandLine.arguments.contains("--ui-fixture") {
                         Task { @MainActor in await runConversationWindowFixtureCheck(chat) }
@@ -163,7 +191,7 @@ struct ClaudeIsolationApplication: App {
         }
             .defaultSize(width: 1280, height: 860)
             .commands { CommandGroup(replacing: .newItem) {} }
-        Settings { SettingsView(model: model, execution: execution, skills: skills, network: network, runtime: runtime, loginReset: loginReset, runtimeVersion: runtimeVersion, browser: browser, configuration: configuration) }
+        Settings { SettingsView(model: model, execution: execution, skills: skills, network: network, runtime: runtime, loginReset: loginReset, runtimeVersion: runtimeVersion, browser: browser, diagnostics: diagnostics, chat: chat, deviceIdentity: deviceIdentity, configuration: configuration) }
     }
 }
 

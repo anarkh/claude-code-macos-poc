@@ -10,11 +10,11 @@ struct ClaudeLoginResetView: View {
             Text("重置 Claude 本地登录状态").font(.system(size: 21, weight: .semibold))
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text("清除本 App 的旧订阅授权。再次使用 Claude 订阅时，需要保存新的 Token。")
+                    Text("清除当前订阅账号的授权。再次使用此账号时，需要保存新的 Token；其他账号保留。")
                     GroupBox {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("停止并等待当前聊天、翻译和连接测试退出", systemImage: "stop.circle")
-                            Label("删除 App 订阅 Token 文件，清空内存和输入框", systemImage: "key")
+                            Label("清除当前账号的 Token，保留账号名称及其他账号", systemImage: "key")
                             Label("清理已确认归属且停止使用的临时运行目录", systemImage: "folder")
                             Text(model.runtimeSummary).foregroundStyle(WorkbenchTheme.secondaryText)
                         }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
@@ -62,9 +62,9 @@ struct ClaudeLoginResetView: View {
         }.padding(24).frame(width: 650, height: 620).background(WorkbenchTheme.canvas)
             .interactiveDismissDisabled(model.isBusy)
             .confirmationDialog("确定重置 App 的 Claude 登录状态？", isPresented: $confirming, titleVisibility: .visible) {
-                Button("删除旧 Token 并重置", role: .destructive) { Task { await model.reset() } }
+                Button("清除当前授权并重置", role: .destructive) { Task { await model.reset() } }
             } message: {
-                Text("当前请求将停止，订阅 Token 会直接删除，不建立备份。会话、Skills、DeepSeek Key 和设置会保留。电脑上的外部 Claude 数据不会删除。")
+                Text("当前请求将停止，当前账号的授权会被清除。其他账号、会话、Skills、DeepSeek Key 和设置会保留。已有迁移备份及电脑上的外部 Claude 数据不会删除。")
             }
     }
 }

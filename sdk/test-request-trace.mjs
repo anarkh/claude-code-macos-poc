@@ -52,6 +52,15 @@ function assertNoSecrets(value, secrets) {
   }
 }
 
+test('project attempts extend to 24 only with explicit request context', () => {
+  for (const attempt of [4, 12, 24]) {
+    const { trace, events } = fixture({ attempt, project: true });
+    trace.start(); trace.receivedStatus(200); trace.response();
+    assert.equal(events.length, 2); assert.equal(events[1].attempt, attempt);
+  }
+  rejected({ attempt: 4 }); rejected({ attempt: 25, project: true }); rejected({ project: 'true' });
+});
+
 test('the final compact serialized request is exact and byte counts use UTF-8', () => {
   const body = JSON.stringify({ model: MODEL, system: '中文 🚲', messages: [
     { role: 'user', content: [{ type: 'text', text: 'quote " and slash \\ and\nnewline' }] },

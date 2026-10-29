@@ -64,26 +64,33 @@ struct ConversationRecord: Codable, Identifiable, Equatable, Sendable {
     var updatedAt: Date
     var draft: String
     var targetLanguage: String
+    var projectDirectory: String?
     var messages: [ConversationMessage]
 
     init(id: UUID = UUID(), title: String = "新会话", createdAt: Date = Date(),
          updatedAt: Date = Date(), draft: String = "", targetLanguage: String = "en",
-         messages: [ConversationMessage] = []) {
+         projectDirectory: String? = nil, messages: [ConversationMessage] = []) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.draft = draft
         self.targetLanguage = targetLanguage
+        self.projectDirectory = projectDirectory
         self.messages = messages
     }
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case id, title, createdAt, updatedAt, draft, targetLanguage, messages
+        case id, title, createdAt, updatedAt, draft, targetLanguage, projectDirectory, messages
     }
 
     init(from decoder: any Decoder) throws {
-        try checkConversationFields(decoder, allowed: CodingKeys.allCases.map(\.rawValue))
+        try self.init(from: decoder, schemaVersion: 3)
+    }
+
+    init(from decoder: any Decoder, schemaVersion: Int) throws {
+        let allowed = CodingKeys.allCases.filter { schemaVersion == 3 || $0 != .projectDirectory }.map(\.rawValue)
+        try checkConversationFields(decoder, allowed: allowed)
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id)
         title = try values.decode(String.self, forKey: .title)
@@ -91,6 +98,7 @@ struct ConversationRecord: Codable, Identifiable, Equatable, Sendable {
         updatedAt = try values.decode(Date.self, forKey: .updatedAt)
         draft = try values.decode(String.self, forKey: .draft)
         targetLanguage = try values.decode(String.self, forKey: .targetLanguage)
+        projectDirectory = try values.decodeIfPresent(String.self, forKey: .projectDirectory)
         messages = try values.decode([ConversationMessage].self, forKey: .messages)
     }
 }
@@ -102,7 +110,7 @@ struct ConversationSnapshot: Codable, Equatable, Sendable {
 
     static let empty = ConversationSnapshot()
 
-    init(schemaVersion: Int = 1, selectedID: UUID? = nil, conversations: [ConversationRecord] = []) {
+    init(schemaVersion: Int = 3, selectedID: UUID? = nil, conversations: [ConversationRecord] = []) {
         self.schemaVersion = schemaVersion
         self.selectedID = selectedID
         self.conversations = conversations
@@ -116,14 +124,18 @@ struct ConversationSnapshot: Codable, Equatable, Sendable {
         try checkConversationFields(decoder, allowed: CodingKeys.allCases.map(\.rawValue))
         let values = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try values.decode(Int.self, forKey: .schemaVersion)
-        guard schemaVersion == 1 else { throw ConversationStoreFailure.unsupportedVersion }
+        guard [1, 2, 3].contains(schemaVersion) else { throw ConversationStoreFailure.unsupportedVersion }
         selectedID = try values.decodeIfPresent(UUID.self, forKey: .selectedID)
-        conversations = try values.decode([ConversationRecord].self, forKey: .conversations)
+        var records = try values.nestedUnkeyedContainer(forKey: .conversations)
+        conversations = []
+        while !records.isAtEnd {
+            conversations.append(try ConversationRecord(from: records.superDecoder(), schemaVersion: schemaVersion))
+        }
         try validate()
     }
 
     func validate() throws {
-        guard schemaVersion == 1 else { throw ConversationStoreFailure.unsupportedVersion }
+        guard [1, 2, 3].contains(schemaVersion) else { throw ConversationStoreFailure.unsupportedVersion }
         var conversationIDs = Set<UUID>()
         var messageIDs = Set<UUID>()
         var seenRunIDs = Set<UUID>()
@@ -133,6 +145,11 @@ struct ConversationSnapshot: Codable, Equatable, Sendable {
             }
             guard ["en", "ja"].contains(conversation.targetLanguage) else {
                 throw ConversationStoreFailure.invalidLanguage
+            }
+            if let directory = conversation.projectDirectory {
+                guard schemaVersion == 3 else { throw ConversationStoreFailure.invalidFormat }
+                do { try ProjectDirectory.validateStoredPath(directory) }
+                catch { throw ConversationStoreFailure.invalidFormat }
             }
             guard conversation.createdAt.timeIntervalSinceReferenceDate.isFinite,
                   conversation.updatedAt.timeIntervalSinceReferenceDate.isFinite else {
@@ -158,11 +175,12 @@ struct ConversationSnapshot: Codable, Equatable, Sendable {
                     }
                 } else if message.requestTraces != nil { throw ConversationStoreFailure.invalidFormat }
                 if let traces = message.requestTraces {
-                    guard message.role == .assistant, let runID = message.runID, traces.count <= 3 else {
+                    guard message.role == .assistant, let runID = message.runID, traces.count <= (schemaVersion == 3 ? 24 : 3) else {
                         throw ConversationStoreFailure.invalidFormat
                     }
                     for (index, trace) in traces.enumerated() {
                         guard trace.attempt == index + 1,
+                              schemaVersion != 1 || trace.schema == "claude-request-trace/v1",
                               index == traces.count - 1 || trace.phase != .request else { throw ConversationStoreFailure.invalidFormat }
                         do { try trace.validate(runID: runID) }
                         catch { throw ConversationStoreFailure.invalidFormat }

@@ -9,18 +9,21 @@ struct SettingsView: View {
     @ObservedObject var loginReset: ClaudeLoginResetModel
     @ObservedObject var runtimeVersion: RuntimeVersionViewModel
     @ObservedObject var browser: BrowserVMController
+    @ObservedObject var diagnostics: DiagnosticsSettingsModel
+    @ObservedObject var chat: ConversationViewModel
+    @ObservedObject var deviceIdentity: DeviceIdentitySettingsModel
     let configuration: AppConfiguration?
     @State private var pane = SettingsPane.execution
     @State private var showingLoginReset = false
     private enum SettingsPane: String, CaseIterable, Identifiable {
-        case execution = "Claude Code", translation = "语言翻译", skills = "Skills", network = "网络", runtime = "运行环境", browser = "浏览器", updates = "更新"
+        case execution = "Claude Code", translation = "语言翻译", skills = "Skills", network = "网络", runtime = "运行环境", browser = "浏览器", diagnostics = "诊断", updates = "更新"
         var id: String { rawValue }
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Picker("设置分类", selection: $pane) {
                 ForEach(SettingsPane.allCases) { Text($0.rawValue).tag($0) }
-            }.pickerStyle(.segmented).accessibilityIdentifier("model-settings-purpose")
+            }.pickerStyle(.segmented).labelsHidden().accessibilityIdentifier("model-settings-purpose")
             if pane == .skills {
                 SkillsSettingsView(model: skills)
             } else {
@@ -30,6 +33,7 @@ struct SettingsView: View {
                     else if pane == .network { NetworkSettingsView(model: network) }
                     else if pane == .updates { updateSettings }
                     else if pane == .browser { BrowserSettingsView(browser: browser) }
+                    else if pane == .diagnostics { DiagnosticsSettingsView(model: diagnostics, chat: chat) }
                     else { RuntimeSettingsView(model: runtime) }
                 }
             }
@@ -75,17 +79,29 @@ struct SettingsView: View {
                 }
                 if let error = execution.error { WorkbenchErrorLine(text: error) }
             }.textFieldStyle(.roundedBorder)
+            if execution.provider == .claudeSubscription {
+                DeviceIdentitySettingsView(model: deviceIdentity, canReplace: canReplaceDeviceIdentity) {
+                    // Recheck live state when the confirmation is accepted.
+                    deviceIdentity.replaceDeviceID(isAllowed: canReplaceDeviceIdentity)
+                }
+            }
             Button("重置 Claude 本地登录状态…") {
                 loginReset.prepare(); showingLoginReset = true
             }.accessibilityIdentifier("open-login-reset")
             Divider()
             VStack(alignment: .leading, spacing: 10) {
-                Label("项目执行入口尚未开放，连接测试仅发送固定文本。", systemImage: "lock")
-                Text("发送会话或测试连接会运行官方 CLI，使用当前来源及统一代理。项目工具、MCP 和项目文件访问仍关闭；代理不可用时停止请求。")
+                Label("在会话中选择执行目录即可读写项目；连接测试仅发送固定文本。", systemImage: "folder")
+                Text("发送会话或测试连接会运行官方 CLI，使用当前来源及统一代理。项目命令在隔离 VM 内运行，只有所选目录与本机共享；MCP、插件及项目设置中的自动 hooks 不启用。未选择目录时保持纯文本聊天，代理不可用时停止请求。")
                 Text("来源和模型保存于 App 设置；API Key 与订阅 Token 分别保存到 App 专用本机明文文件，文件权限仅限当前 macOS 账号。同账号下其他程序仍可能读取。")
-                Text("打开设置时自动恢复已保存的凭据，以遮罩显示；更新或重启后可继续复用。修改凭据须单独保存，保存模型配置不保存凭据。凭据不写入会话、公开配置或日志；真实订阅 Token 由可信宿主桥接进程使用，不进入 VM。")
+                Text("API Key 在打开设置时以遮罩恢复；订阅账号的旧 Token 不回显，更新时填写新值。修改凭据须单独保存，保存模型配置不保存凭据。凭据不写入会话、公开配置或日志；真实订阅 Token 由可信宿主桥接进程使用，不进入 VM。")
             }.font(.system(size: 12)).foregroundStyle(WorkbenchTheme.secondaryText).fixedSize(horizontal: false, vertical: true)
         }.accessibilityIdentifier("execution-settings")
+    }
+
+    private var canReplaceDeviceIdentity: Bool {
+        chat.isTerminationWorkSettled && !chat.isTerminationInProgress && !chat.isLoginResetInProgress
+            && execution.isTerminationWorkSettled && !execution.isTerminationInProgress && !execution.isLoginResetInProgress
+            && !loginReset.isBusy && !runtimeVersion.isBusy
     }
 
     private var updateSettings: some View {
@@ -144,22 +160,16 @@ struct SettingsView: View {
                     Text("Haiku").tag("haiku")
                 }.labelsHidden().accessibilityIdentifier("subscription-model").accessibilityLabel("Claude 订阅模型")
             }
-            field("订阅 Token") {
-                SecureField("粘贴 sk-ant-oat01- 开头的 Token", text: $execution.subscriptionToken)
-                    .accessibilityIdentifier("subscription-token").accessibilityLabel("Claude 订阅 Token")
+            if let accounts = execution.subscriptionAccounts {
+                SubscriptionAccountsView(model: accounts, canManage: accounts.canMutate()) { id, startNew in
+                    guard accounts.select(id: id) else { return }
+                    if startNew { chat.newConversation() }
+                }
             }
-            HStack(spacing: 10) {
-                Button("保存订阅 Token", action: execution.saveSubscriptionToken)
-                    .disabled(execution.subscriptionToken.isEmpty).accessibilityIdentifier("save-subscription-token")
-                Button("读取已保存 Token", action: execution.loadSubscriptionToken).accessibilityIdentifier("load-subscription-token")
-                Button("删除已保存 Token", role: .destructive, action: execution.deleteSubscriptionToken)
-                    .accessibilityIdentifier("delete-subscription-token")
-            }.controlSize(.small)
-            Text(execution.subscriptionCredentialStatus).font(.system(size: 12)).foregroundStyle(WorkbenchTheme.secondaryText)
             VStack(alignment: .leading, spacing: 8) {
-                Text("在终端运行 claude setup-token，使用订阅账号完成浏览器授权，再将生成的 Token 粘贴到这里。")
+                Text("在终端运行 claude setup-token，使用对应订阅账号完成浏览器授权，再添加账号并粘贴生成的 Token。")
                 Text("Token 有效期一年；到期或撤销后需重新生成并保存。模型可用性及额度以订阅账号为准，连接测试也会消耗订阅额度。")
-                Text("App 使用专用本机 Token 文件，不读取系统钥匙串。切换来源保留两边的配置与凭据，翻译始终使用 DeepSeek。")
+                Text("账号及 Token 保存于 App 专用本机文件，不读取系统钥匙串。额度查询可能因 Token 权限不足而不可用，不影响正常聊天。切换执行账号不改变翻译配置。")
             }.font(.system(size: 12)).foregroundStyle(WorkbenchTheme.secondaryText).fixedSize(horizontal: false, vertical: true)
         }
     }

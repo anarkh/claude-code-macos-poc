@@ -2,8 +2,8 @@
 set -euo pipefail
 app_root=$(cd "$(dirname "$0")" && pwd)
 project_root=$(cd "$app_root/.." && pwd)
-app_version=0.13.3
-app_build=25
+app_version=0.13.5
+app_build=27
 node_executable=${1:-}
 browser_images=${3:-"$project_root/host/browser-runtime/images"}
 if [ -z "$node_executable" ]; then
@@ -25,7 +25,8 @@ sys.path.insert(0, str(root / 'host/text-runtime'))
 from common import validate_base
 validate_base(root / 'host/text-runtime/images')
 PY
-"$node_executable" --test "$project_root/sdk/test-vm-text-chat.mjs" "$project_root/sdk/test-request-trace.mjs" "$project_root/guest/text-runtime/test-runtime.mjs"
+"$node_executable" --test "$project_root/sdk/test-vm-text-chat.mjs" "$project_root/sdk/test-request-trace.mjs" "$project_root/sdk/test-project-provider-protocol.mjs" "$project_root/sdk/test-project-relay.mjs" "$project_root/sdk/test-subscription-quota.mjs" "$project_root/guest/text-runtime/test-runtime.mjs"
+python3 -m unittest discover -s "$project_root/host/text-runtime" -p 'test_project_launch.py'
 "$node_executable" --test "$project_root"/updates/test-*.mjs
 swift build --package-path "$app_root" -c release --arch arm64
 binary="$app_root/.build/arm64-apple-macosx/release/ClaudeIsolationPoC"
@@ -53,7 +54,7 @@ runtime = contents / 'Resources' / 'Runtime'
 # inside the verified guest disk, not as importable host node_modules.
 for directory, files in {
     'translation': ['stdio.mjs', 'client.mjs', 'pipeline.mjs', 'protected-text.mjs', 'errors.mjs'],
-    'sdk': ['vm-text-chat.mjs', 'vm-text-smoke.mjs', 'deepseek-text-chat.mjs', 'deepseek-text-smoke.mjs', 'owned-run-directory.mjs', 'request-trace.mjs', 'package.json'],
+    'sdk': ['vm-text-chat.mjs', 'vm-text-smoke.mjs', 'deepseek-text-chat.mjs', 'deepseek-text-smoke.mjs', 'owned-run-directory.mjs', 'request-trace.mjs', 'project-provider-protocol.mjs', 'subscription-quota.mjs', 'package.json'],
     'network': ['proxy-transport.mjs'],
     'runtime': ['profile.mjs'],
     'updates': ['stdio.mjs', 'client.mjs', 'health.mjs', 'official-stdio.mjs', 'official-client.mjs', 'official-integrity.mjs', 'local-builder.mjs'],
